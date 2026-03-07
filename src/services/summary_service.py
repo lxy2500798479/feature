@@ -48,7 +48,14 @@ class SummaryService:
             content=content[:4000],
         )
         
-        result = self.llm.chat(prompt, max_tokens=self.max_length * 2)
+        # no_think=True: 禁用 qwen3 思考模式，减少 token 消耗，直接输出摘要
+        # max_tokens 设大一些（4096）避免推理链截断
+        result = self.llm.chat(
+            prompt,
+            max_tokens=4096,
+            temperature=0.1,
+            no_think=True,
+        )
         
         if result:
             return result.strip()[:self.max_length]

@@ -7,19 +7,35 @@ from pathlib import Path
 from src.core.models import ParsedDocument
 class BaseParser(ABC):
     """解析器基类"""
-    
+
     def __init__(self, config: Optional[Dict] = None):
         self.config = config or {}
-    
+
     @abstractmethod
     def parse(self, file_path: str) -> ParsedDocument:
         """解析文件"""
         pass
-    
+
     @abstractmethod
     def supports(self, file_path: str) -> bool:
         """检查是否支持该文件类型"""
         pass
+
+    def _extract_metadata(self, file_path: str):
+        """提取文档元数据"""
+        from datetime import datetime
+        from src.core.models import DocumentMetadata
+        import hashlib
+
+        path = Path(file_path)
+        doc_id = hashlib.md5(str(path.absolute()).encode()).hexdigest()
+
+        return DocumentMetadata(
+            doc_id=doc_id,
+            title=path.stem,
+            file_path=str(path.absolute()),
+            file_type=path.suffix.lower()
+        )
 
 
 class ParserRegistry:

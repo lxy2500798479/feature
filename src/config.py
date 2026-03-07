@@ -69,8 +69,8 @@ class Settings(BaseSettings):
     SUMMARY_ENABLED: bool = True
     SUMMARY_MODEL: str = "qwen2.5-14b"
     SUMMARY_MAX_LENGTH: int = 200
-    SUMMARY_CONCURRENCY: int = 5
-    SUMMARY_TIMEOUT: int = 30
+    SUMMARY_CONCURRENCY: int = 3
+    SUMMARY_TIMEOUT: int = 600
     SUMMARY_API_URL: Optional[str] = None
     SUMMARY_API_KEY: Optional[str] = None
     
@@ -88,6 +88,12 @@ class Settings(BaseSettings):
     VISION_API_URL: str = "https://new-api-dev.10rig.com:8443/v1/chat/completions"
     VISION_API_KEY: Optional[str] = None
     VISION_MODEL: str = "qwen2.5-vl-7b"
+
+    # 图片处理配置
+    IMAGE_PROCESSING_ENABLED: bool = True
+    IMAGE_MAX_CONCURRENCY: int = 10
+    IMAGE_MIN_HEIGHT: int = 100  # 最小高度阈值，低于此值的图片视为图标过滤掉
+    IMAGE_PAGE_MIN_TEXT_LENGTH: int = 50  # 页面最小文字数量，低于此值的页面图片全部过滤
 
     # 数据库重置配置
     RESET_GRAPH_DB: bool = False

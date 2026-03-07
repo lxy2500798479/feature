@@ -85,6 +85,8 @@ class ConceptNode(BaseModel):
 
 class ParsedDocument(BaseModel):
     """解析后的文档"""
+    model_config = {"extra": "allow"}  # 允许额外字段（如 raw_content_list, extract_dir）
+    
     metadata: DocumentMetadata
     sections: List[SectionNode] = Field(default_factory=list)
     chunks: List[ChunkNode] = Field(default_factory=list)
@@ -131,6 +133,11 @@ class EnhancedQueryRequest(BaseModel):
     use_graph: bool = True
     use_vector: bool = True
     filters: Dict[str, Any] = Field(default_factory=dict)
+    doc_ids: Optional[List[str]] = None
+    budget_profile: str = "medium"
+    enable_lazy_enhance: bool = True
+    override_query_type: Optional[str] = None
+    retrieval_mode: str = "auto"
 
 
 class EnhancedQueryResponse(BaseModel):
@@ -143,6 +150,10 @@ class EnhancedQueryResponse(BaseModel):
 
 class QueryMeta(BaseModel):
     """查询元数据"""
-    query_id: str
-    timestamp: datetime
-    processing_time: float
+    query_type: str = "auto"
+    retrieval_paths_used: List[str] = Field(default_factory=list)
+    budget_consumed: Optional[Dict[str, Any]] = None
+    latency_breakdown: Optional[Dict[str, Any]] = None
+    degraded: bool = False
+    degradation_reasons: List[str] = Field(default_factory=list)
+    trace_id: str = ""

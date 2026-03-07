@@ -239,9 +239,10 @@ class CommunitySummaryService:
         try:
             result = self.llm.chat(
                 prompt=prompt,
-                system=COMMUNITY_SUMMARY_SYSTEM,
-                max_tokens=300,
-                temperature=0.3,
+                system_prompt=COMMUNITY_SUMMARY_SYSTEM,
+                max_tokens=4096,
+                temperature=0.1,
+                no_think=True,
             )
             if result:
                 logger.debug(

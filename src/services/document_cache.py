@@ -35,6 +35,27 @@ class DocumentCache:
             "timestamp": time.time()
         }
 
+    def put(self, key: str, data: Dict[str, Any]) -> None:
+        """设置缓存（put 方法的别名）"""
+        self.set(key, data)
+
+    def acquire(self, key: str) -> Optional[Dict[str, Any]]:
+        """获取并删除缓存（原子操作）"""
+        if key in self.cache:
+            entry = self.cache[key]
+            if time.time() - entry["timestamp"] < self.ttl:
+                data = entry["data"]
+                del self.cache[key]  # 获取后删除
+                return data
+            else:
+                del self.cache[key]
+        return None
+
     def clear(self) -> None:
         """清空缓存"""
         self.cache.clear()
+    
+    def release(self, key: str) -> None:
+        """释放缓存（删除缓存项）"""
+        if key in self.cache:
+            del self.cache[key]

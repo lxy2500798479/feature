@@ -69,7 +69,8 @@ class DocumentService:
         doc_id = parsed_doc.metadata.doc_id
         need_community_summary = settings.SUMMARY_ENABLED and concept_graph.get("communities")
         community_summary_time = 0.0
-        
+        section_summary_time = 0.0
+
         if need_community_summary:
             community_summary_time = self._generate_community_summary(
                 parsed_doc=parsed_doc,
@@ -77,6 +78,22 @@ class DocumentService:
                 doc_id=doc_id,
                 need_community_summary=need_community_summary,
             )
+
+        # 4b. 生成 Section Summary（CoE Step 2 精排用）
+        # 异步后台执行，不阻塞文档入库响应（推理模型可能耗时较长）
+        if settings.SUMMARY_ENABLED and parsed_doc.sections:
+            import threading
+            def _bg_section_summary():
+                self._generate_section_summaries(parsed_doc)
+            threading.Thread(target=_bg_section_summary, daemon=True, name="section-summary").start()
+            logger.info(f"Section 摘要生成已在后台启动 ({len(parsed_doc.sections)} 个章节)")
+
+        # 4c. LLM 实体关系抽取（Enhanced-KG） — 异步后台执行
+        import threading
+        def _bg_entity_extract():
+            self._extract_and_store_entities(parsed_doc)
+        threading.Thread(target=_bg_entity_extract, daemon=True, name="entity-extract").start()
+        logger.info(f"Entity 抽取已在后台启动 ({len(parsed_doc.chunks)} 个 chunk)")
         
         # 更新文档状态
         self._update_document_status(
@@ -89,13 +106,22 @@ class DocumentService:
             "store": f"{store_time:.2f}s",
             "concept_graph": f"{concept_time:.2f}s",
             "community_summary": f"{community_summary_time:.2f}s",
+            "section_summary": "async(background)",
         }
         
         if async_mode:
-            self._doc_cache.put(doc_id, (parsed_doc, concept_graph))
+            # 存入缓存：包含 parsed_doc, concept_graph, extract_dir（图片处理需要）
+            self._doc_cache.put(doc_id, {
+                "parsed_doc": parsed_doc,
+                "concept_graph": concept_graph,
+                "extract_dir": parsed_doc.extract_dir
+            })
             
             # 启动后台任务生成向量
             asyncio.create_task(self._generate_embeddings_async(doc_id))
+            
+            # 启动后台任务处理图片
+            asyncio.create_task(self._process_images_async(doc_id))
             
             return {
                 "doc_id": doc_id,
@@ -202,17 +228,48 @@ class DocumentService:
         except Exception as e:
             logger.error(f"社区摘要生成失败: {e}")
             return 0.0
+
+    def _generate_section_summaries(self, parsed_doc) -> float:
+        """为文档所有 Section 生成摘要并写入 NebulaGraph
+        
+        注意：如果摘要模型响应较慢（如推理模型），此步骤可能耗时较长。
+        失败时不影响文档正常入库，只是 CoE Step2 精排时无摘要可用（降级为频率排序）。
+        """
+        step_start = time.time()
+        try:
+            from src.services.summary_service import SummaryService
+            svc = SummaryService()
+            summaries = svc.generate_summaries_for_sections(
+                sections=parsed_doc.sections,
+                chunks=parsed_doc.chunks,
+            )
+            non_empty = {sid: s for sid, s in summaries.items() if s}
+            if non_empty:
+                self.nebula_client.update_section_summaries(non_empty)
+                logger.info(f"✅ Section 摘要生成完成: {len(non_empty)} 个 (耗时: {time.time()-step_start:.2f}秒)")
+            else:
+                logger.info("Section 摘要生成结果为空（模型超时或返回空）")
+            return time.time() - step_start
+        except Exception as e:
+            logger.warning(f"Section 摘要生成失败（不影响文档处理）: {e}")
+            return 0.0
     
     async def _generate_embeddings_async(self, doc_id: str):
         """异步生成向量嵌入"""
         await asyncio.sleep(0.1)  # 让出控制权
         
-        cached = self._doc_cache.acquire(doc_id)
+        cached = self._doc_cache.get(doc_id)
         if cached is None:
             logger.error(f"文档数据未缓存: {doc_id}")
             return
         
-        parsed_doc, concept_graph = cached
+        # 新缓存结构是 dict
+        parsed_doc = cached.get("parsed_doc")
+        concept_graph = cached.get("concept_graph")
+        
+        if parsed_doc is None or concept_graph is None:
+            logger.error(f"文档缓存数据不完整: {doc_id}")
+            return
         
         try:
             embeddings = self._generate_embeddings(parsed_doc, concept_graph)
@@ -231,8 +288,8 @@ class DocumentService:
                 embedding_task_status="failed",
                 embedding_error=str(e)
             )
-        finally:
-            self._doc_cache.release(doc_id)
+        # 注意：不再在这里释放缓存，因为图片处理任务可能还在使用
+        # 缓存将依赖 TTL 自动过期
     
     def _generate_embeddings(self, parsed_doc: ParsedDocument, concept_graph: Dict) -> List[Dict]:
         """生成向量嵌入"""
@@ -276,3 +333,157 @@ class DocumentService:
     def _update_document_status(self, doc_id: str, **kwargs):
         """更新文档状态"""
         self.nebula_client.update_document(doc_id, kwargs)
+
+    async def generate_embeddings_async(self, doc_id: str):
+        """异步生成向量嵌入（公共方法）"""
+        await self._generate_embeddings_async(doc_id)
+
+    async def process_images_async(self, doc_id: str):
+        """异步处理图片（公共方法）"""
+        await self._process_images_async(doc_id)
+
+    async def _process_images_async(self, doc_id: str):
+        """异步处理图片"""
+        await asyncio.sleep(0.1)  # 让出控制力
+        
+        cached = self._doc_cache.get(doc_id)
+        if cached is None:
+            logger.error(f"文档数据未缓存: {doc_id}")
+            return
+        
+        # 新缓存结构是 dict
+        parsed_doc = cached.get("parsed_doc")
+        extract_dir = cached.get("extract_dir")
+        
+        if parsed_doc is None or extract_dir is None:
+            logger.error(f"文档缓存数据不完整: {doc_id}")
+            return
+        
+        try:
+            # 构建 page_text_map
+            page_text_map = {}
+            for chunk in parsed_doc.chunks:
+                # 从 chunk_id 提取 page_idx（如果有的话）
+                # 这里简化处理，直接从 raw_content_list 获取
+                pass
+            
+            # 如果有 raw_content_list，使用它构建 page_text_map
+            raw_content_list = getattr(parsed_doc, 'raw_content_list', [])
+            if raw_content_list:
+                # 构建 page -> text 映射
+                for item in raw_content_list:
+                    if item.get("type") == "text":
+                        page = item.get("page_idx", 0)
+                        text = item.get("text", "")
+                        if page not in page_text_map:
+                            page_text_map[page] = ""
+                        page_text_map[page] += text
+            
+            # 处理图片
+            if raw_content_list:
+                result = self.image_service.process_images(
+                    content_list=raw_content_list,
+                    doc_id=doc_id,
+                    extract_dir=extract_dir,
+                    page_text_map=page_text_map
+                )
+                
+                image_chunks = result.get("image_chunks", [])
+                table_chunks = result.get("table_chunks", [])
+                
+                if image_chunks or table_chunks:
+                    # 生成图片/表格 chunk 的向量
+                    all_chunks = image_chunks + table_chunks
+                    embeddings = []
+                    for chunk in all_chunks:
+                        embedding = self.text_embedder.embed_text(chunk.text)
+                        embeddings.append({
+                            "doc_id": doc_id,
+                            "chunk_id": chunk.chunk_id,
+                            "text": chunk.text,
+                            "embedding": embedding,
+                            "metadata": {
+                                "type": "image" if chunk.chunk_id.startswith("img_") else "table",
+                                "section_id": chunk.section_id
+                            }
+                        })
+                    
+                    if embeddings:
+                        self._store_embeddings(embeddings)
+                        logger.info(f"✅ 图片/表格向量存储完成: {len(embeddings)} 条")
+                    
+                    # 更新文档状态
+                    self._update_document_status(
+                        doc_id,
+                        image_chunks_count=len(image_chunks),
+                        table_chunks_count=len(table_chunks),
+                        image_processing_status="completed"
+                    )
+                else:
+                    logger.info(f"没有需要处理的图片/表格")
+                    self._update_document_status(
+                        doc_id,
+                        image_chunks_count=0,
+                        table_chunks_count=0,
+                        image_processing_status="completed"
+                    )
+                
+                logger.info(f"🎉 图片处理完成: {doc_id}")
+            else:
+                logger.warning(f"没有 raw_content_list 数据: {doc_id}")
+                
+        except Exception as e:
+            logger.error(f"图片处理失败: {e}")
+            self._update_document_status(
+                doc_id,
+                image_processing_status="failed",
+                image_processing_error=str(e)
+            )
+
+    def get_document_status(self, doc_id: str) -> Dict[str, Any]:
+        """获取文档状态"""
+        return self.nebula_client.get_document_status(doc_id)
+
+    def list_documents(self) -> List[Dict[str, Any]]:
+        """列出所有文档"""
+        try:
+            documents = self.nebula_client.get_documents()
+            return documents
+        except Exception as e:
+            logger.error(f"列出文档失败: {e}")
+            raise
+
+    def _extract_and_store_entities(self, parsed_doc) -> None:
+        """后台任务：用 Qwen3.5 从 chunk 抽取实体关系并写入 NebulaGraph（Enhanced-KG）"""
+        from src.graph.entity_extractor import EntityExtractor
+        from src.utils.llm_client import LLMClient
+
+        doc_id = parsed_doc.metadata.doc_id
+        start = time.time()
+        try:
+            summary_llm = LLMClient(
+                api_url=settings.SUMMARY_API_URL,
+                api_key=settings.SUMMARY_API_KEY,
+                model=settings.SUMMARY_MODEL,
+                timeout=getattr(settings, "SUMMARY_TIMEOUT", 300),
+            )
+            extractor = EntityExtractor(llm_client=summary_llm, max_workers=3)
+            result = extractor.extract_from_chunks(
+                chunks=parsed_doc.chunks,
+                doc_id=doc_id,
+                max_chunks=50,
+            )
+            if result["entities"]:
+                self.nebula_client.insert_entity_graph(
+                    doc_id=doc_id,
+                    entities=result["entities"],
+                    relations=result["relations"],
+                )
+                logger.info(
+                    f"✅ Entity 抽取完成: {len(result['entities'])} 实体, "
+                    f"{len(result['relations'])} 关系 (耗时: {time.time()-start:.1f}s)"
+                )
+            else:
+                logger.info(f"Entity 抽取结果为空 (doc={doc_id})")
+        except Exception as e:
+            logger.error(f"Entity 抽取失败 (doc={doc_id}): {e}")

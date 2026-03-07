@@ -18,32 +18,32 @@ from src.utils.logger import logger
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
+    # 防止重复初始化（uvicorn reload 模式会启动多个进程）
+    if hasattr(app.state, "_initialized") and app.state._initialized:
+        yield
+        return
+
+    app.state._initialized = True
+
     # 启动时
     logger.info("正在启动 FinalRAG Phase 1...")
-    
+
     # 初始化 NebulaGraph Schema
     try:
         nebula_client = NebulaClient()
         nebula_client.connect()
-        
+
         if settings.RESET_GRAPH_DB:
             logger.warning("⚠️  RESET_GRAPH_DB=True，正在重置 NebulaGraph...")
             nebula_client.reset_space()
         else:
             nebula_client.init_schema()
             logger.info("NebulaGraph schema 已初始化")
-        
-        # Schema V2 迁移
-        try:
-            nebula_client.migrate_schema_v2()
-            logger.info("Schema V2 迁移完成")
-        except Exception as e:
-            logger.error(f"Schema V2 迁移失败（不阻止启动）: {e}")
-        
+
         nebula_client.close()
     except Exception as e:
         logger.error(f"NebulaGraph 初始化失败: {e}")
-    
+
     # 重置 Milvus（如果配置）
     if settings.RESET_VECTOR_DB:
         try:
@@ -52,9 +52,9 @@ async def lifespan(app: FastAPI):
             milvus_client.reset_collection()
         except Exception as e:
             logger.error(f"Milvus 重置失败（不阻止启动）: {e}")
-    
+
     yield
-    
+
     # 关闭时
     logger.info("正在关闭 FinalRAG Phase 1...")
 

@@ -5,6 +5,7 @@ from typing import List, Dict, Tuple, Set, Optional
 from collections import defaultdict, Counter
 import math
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
 
 import spacy
@@ -88,7 +89,7 @@ class ConceptGraphBuilder:
         
         # 1. 提取名词短语
         step_start = time.time()
-        texts = [c.text for c in chunks]
+        texts = [self._clean_text(c.text) for c in chunks]
         n_process = self.n_process
         if n_process is None:
             n_process = min(4, (os.cpu_count() or 2))
@@ -199,6 +200,10 @@ class ConceptGraphBuilder:
         "个", "只", "条", "种", "位", "名", "头", "句", "片", "道",
     }
 
+    # Markdown / HTML 伪文本过滤正则（预编译，复用）
+    _RE_MD_ARTIFACT = re.compile(r'[(){}\[\]!<>|#@\\]')
+    _RE_NUMERIC_FRAG = re.compile(r'\d+[%\-/]\d*|\d{4,}')
+
     def _is_valid_phrase(self, phrase: str) -> bool:
         """验证短语是否有效"""
         if len(phrase) < 2:
@@ -211,8 +216,36 @@ class ConceptGraphBuilder:
             return False
         if all(c in "一二三四五六七八九十百千万亿零两" for c in phrase):
             return False
+        # 含括号、方括号、感叹号等 Markdown/特殊符号 → 是图片占位符或格式碎片
+        if self._RE_MD_ARTIFACT.search(phrase):
+            return False
+        # 数字混杂碎片：1%5、100-200 等
+        if self._RE_NUMERIC_FRAG.search(phrase):
+            return False
+        # 中文文档中，纯 ASCII 且长度 ≤ 2 的基本是噪音（js、cf、ix、pg 等）
+        if phrase.isascii() and len(phrase) <= 2:
+            return False
+        # 首尾带标点的残片
+        if phrase[0] in '.,;:!?、。，；：' or phrase[-1] in '.,;:!?、。，；：':
+            return False
         return True
-    
+
+    # 预编译清洗正则
+    _RE_CLEAN_IMG  = re.compile(r'!\[.*?\]\(.*?\)', re.DOTALL)   # Markdown 图片
+    _RE_CLEAN_LINK = re.compile(r'\[([^\]]*)\]\([^)]*\)')        # Markdown 链接 → 保留文字
+    _RE_CLEAN_HTML = re.compile(r'<[^>]+>')                       # HTML 标签
+    _RE_CLEAN_CODE = re.compile(r'`[^`]*`')                      # 行内代码
+    _RE_CLEAN_SPEC = re.compile(r'[*_~^]+')                      # 加粗/斜体符号
+
+    def _clean_text(self, text: str) -> str:
+        """清理文本中的 Markdown / HTML 格式标记，防止产生噪音概念"""
+        text = self._RE_CLEAN_IMG.sub(' ', text)       # 删图片占位符
+        text = self._RE_CLEAN_LINK.sub(r'\1', text)    # 链接只保留文字
+        text = self._RE_CLEAN_HTML.sub(' ', text)       # 删 HTML 标签
+        text = self._RE_CLEAN_CODE.sub(' ', text)       # 删行内代码
+        text = self._RE_CLEAN_SPEC.sub('', text)        # 删 * _ ~ 等格式符
+        return text
+
     def _compute_cooccurrence(self, phrases: List[str]):
         """单 chunk 共现计算"""
         cooccur, tw = self._compute_cooccurrence_return(phrases)

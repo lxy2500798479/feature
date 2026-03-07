@@ -103,3 +103,15 @@ class TextEmbedder:
             return self.embedder.encode(texts)
         else:
             raise ValueError("嵌入器不支持批量编码")
+
+    def embed_single(self, text: str) -> List[float]:
+        """为单条文本生成嵌入向量（查询时使用）"""
+        if not self.embedder:
+            logger.warning("嵌入器未初始化，返回零向量")
+            return [0.0] * self.dimension
+
+        result = self._encode_texts([text])
+        vec = result[0]
+        if hasattr(vec, 'tolist'):
+            return vec.tolist()
+        return list(vec)
