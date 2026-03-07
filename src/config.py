@@ -99,6 +99,12 @@ class Settings(BaseSettings):
     RESET_GRAPH_DB: bool = False
     RESET_VECTOR_DB: bool = False
 
+    # 功能模块开关 (可插拔)
+    ENABLE_IMAGE_ENTITY_EXTRACTION: bool = True  # 图片实体提取
+    ENABLE_CONCEPT_GRAPH: bool = True            # 概念图谱
+    ENABLE_ASYNC_EMBEDDING: bool = True          # 异步嵌入
+    ENABLE_SUMMARY: bool = True                   # 摘要生成
+
     # 上传配置
     UPLOAD_DIR: Path = PROJECT_ROOT / "uploads"
     MAX_UPLOAD_SIZE: int = 100 * 1024 * 1024  # 100MB

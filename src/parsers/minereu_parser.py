@@ -183,7 +183,15 @@ class MinereuParser(BaseParser):
         """从解压目录中读取 content_list.json"""
         extract_path = Path(extract_dir)
 
-        # 递归查找 content_list.json
+        # 递归查找 *content_list.json（匹配带前缀的文件名）
+        for json_file in extract_path.rglob("*content_list.json"):
+            with open(json_file, 'r', encoding='utf-8') as f:
+                try:
+                    return json.load(f)
+                except json.JSONDecodeError:
+                    self.logger.warning(f"JSON 解析失败: {json_file}")
+
+        # 备用：精确匹配 content_list.json
         for json_file in extract_path.rglob("content_list.json"):
             with open(json_file, 'r', encoding='utf-8') as f:
                 try:

@@ -196,6 +196,14 @@ class NebulaClient:
                     description string DEFAULT "",
                     strength double DEFAULT 1.0
                 );""",
+                # 图片实体图谱
+                """CREATE TAG IF NOT EXISTS ImageEntity (
+                    name string,
+                    image_type string,
+                    source_chunk_id string,
+                    description string,
+                    doc_id string
+                );""",
             ]
             
             for tag_query in tags:
@@ -553,6 +561,50 @@ class NebulaClient:
                 r = session.execute(query)
                 if not r.is_succeeded():
                     self.logger.warning(f"COOCCURS_WITH 边插入失败 {src_id}->{dst_id}: {r.error_msg()}")
+    
+    def insert_image_entities(self, nodes: List, edges: List[Dict]):
+        """插入图片实体节点和边"""
+        if not nodes:
+            return
+            
+        with self.get_session() as session:
+            session.execute(f"USE {self.space_name};")
+            
+            # 插入 ImageEntity 节点
+            for node in nodes:
+                node_id = node.node_id if hasattr(node, 'node_id') else node.get("node_id", "")
+                props = node.properties if hasattr(node, 'properties') else node.get("properties", {})
+                
+                name = props.get("name", "").replace('"', '\\"').replace('\\', '\\\\')
+                image_type = props.get("image_type", "").replace('"', '\\"')
+                source_chunk_id = props.get("source_chunk_id", "").replace('"', '\\"')
+                description = props.get("description", "").replace('"', '\\"').replace('\\', '\\\\')
+                doc_id = node.doc_id if hasattr(node, 'doc_id') else node.get("doc_id", "")
+                
+                query = f'''INSERT VERTEX ImageEntity(
+                    name, image_type, source_chunk_id, description, doc_id
+                ) VALUES "{node_id}":(
+                    "{name}", "{image_type}", "{source_chunk_id}", "{description}", "{doc_id}"
+                );'''
+                session.execute(query)
+            
+            # 插入关系边
+            for edge in edges:
+                src_id = edge.get("src_id", "")
+                dst_id = edge.get("dst_id", "")
+                edge_type = edge.get("edge_type", "relates_to").replace('"', '\\"')
+                props = edge.get("properties", {})
+                source = props.get("source", "image")
+                image_type = props.get("image_type", "").replace('"', '\\"')
+                
+                query = f'''INSERT EDGE {edge_type}(
+                    source, image_type
+                ) VALUES "{src_id}"->"{dst_id}":(
+                    "{source}", "{image_type}"
+                );'''
+                r = session.execute(query)
+                if not r.is_succeeded():
+                    self.logger.warning(f"图片关系边插入失败 {src_id}->{dst_id}: {r.error_msg()}")
 
     def store_community_summaries(self, doc_id: str, summaries: Dict[int, str]):
         """存储社区摘要"""

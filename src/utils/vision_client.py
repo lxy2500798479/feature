@@ -2,11 +2,42 @@
 视觉模型客户端 - 使用 qwen2.5-vl-7b
 """
 from typing import Optional, Dict, Any, List
+from enum import Enum
 import base64
 import requests
 
 from src.config import settings
 from src.utils.logger import logger
+
+
+class ImageGraphType(Enum):
+    """图片类型枚举 - 用于知识图谱"""
+    ARCHITECTURE = "architecture"      # 架构图
+    FLOWCHART = "flowchart"           # 流程图
+    UML = "uml"                        # UML图/类图
+    MINDMAP = "mindmap"               # 思维导图
+    ORG_CHART = "org_chart"           # 组织架构图
+    ENTITY_RELATION = "entity_relation"  # 实体关系图
+    TIMELINE = "timeline"              # 时间线
+    COMPARISON = "comparison"          # 对比图
+    SCREENSHOT = "screenshot"          # 界面截图
+    CHART = "chart"                   # 统计图表
+    PHOTO = "photo"                   # 照片
+    DECORATION = "decoration"         # 装饰性图片（图标、插图等）
+    UNKNOWN = "unknown"               # 未知类型
+
+
+# 配置：哪些类型需要加入知识图谱
+IMAGE_TYPES_FOR_GRAPH = {
+    ImageGraphType.ARCHITECTURE,
+    ImageGraphType.FLOWCHART,
+    ImageGraphType.UML,
+    ImageGraphType.MINDMAP,
+    ImageGraphType.ORG_CHART,
+    ImageGraphType.ENTITY_RELATION,
+    ImageGraphType.TIMELINE,
+    ImageGraphType.COMPARISON,
+}
 
 
 class VisionClient:
@@ -110,3 +141,85 @@ class VisionClient:
             result = self.describe_image(path, prompt)
             results.append(result)
         return results
+
+    def classify_image_type(self, image_path: str) -> Dict[str, Any]:
+        """
+        识别图片类型，并判断是否需要加入知识图谱
+        
+        Returns:
+            {
+                "type": ImageGraphType,  # 图片类型
+                "need_graph": bool,       # 是否需要加入图谱
+                "description": str,       # 图片描述
+                "entities": List[str],    # 提取的实体
+                "relations": List[Dict]  # 提取的关系 [(实体1, 关系, 实体2)]
+            }
+        """
+        type_prompt = """请分析这张图片的类型和内容。
+
+图片类型分类：
+- architecture: 架构图（系统架构、软件架构、网络架构等）
+- flowchart: 流程图（业务流程、工作流程、算法流程等）
+- uml: UML图/类图（类之间的关系、对象结构等）
+- mindmap: 思维导图
+- org_chart: 组织架构图（人员结构、部门层级等）
+- entity_relation: 实体关系图（E-R图、数据库Schema等）
+- timeline: 时间线
+- comparison: 对比图（表格、对比分析等）
+- screenshot: 界面截图
+- chart: 统计图表（柱状图、饼图、折线图等）
+- photo: 照片
+- decoration: 装饰性图片（图标、插图、背景图等）
+- unknown: 未知类型
+
+请按以下JSON格式返回：
+```json
+{
+    "type": "类型名称",
+    "need_graph": true/false,
+    "description": "简要描述图片内容（不超过100字）",
+    "entities": ["实体1", "实体2", ...],
+    "relations": [["实体1", "关系名称", "实体2"], ...]
+}
+```
+
+只返回JSON，不要其他内容。"""
+
+        result_text = self.describe_image(image_path, type_prompt)
+        
+        # 解析JSON结果
+        try:
+            import json
+            # 尝试提取JSON部分
+            json_match = result_text.strip()
+            if "```json" in json_match:
+                json_match = json_match.split("```json")[1].split("```")[0]
+            elif "```" in json_match:
+                json_match = json_match.split("```")[1].split("```")[0]
+            
+            data = json.loads(json_match.strip())
+            
+            # 转换为枚举类型
+            img_type = ImageGraphType.UNKNOWN
+            type_str = data.get("type", "unknown").lower()
+            for et in ImageGraphType:
+                if et.value == type_str:
+                    img_type = et
+                    break
+            
+            return {
+                "type": img_type,
+                "need_graph": data.get("need_graph", img_type in IMAGE_TYPES_FOR_GRAPH),
+                "description": data.get("description", ""),
+                "entities": data.get("entities", []),
+                "relations": data.get("relations", [])
+            }
+        except Exception as e:
+            logger.warning(f"图片类型解析失败: {e}, 使用默认分类")
+            return {
+                "type": ImageGraphType.UNKNOWN,
+                "need_graph": False,
+                "description": result_text[:100] if result_text else "",
+                "entities": [],
+                "relations": []
+            }

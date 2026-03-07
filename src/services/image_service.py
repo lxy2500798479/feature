@@ -162,6 +162,10 @@ class ImageService:
         if not img_path or not os.path.exists(img_path):
             return None
 
+        # 1. 先识别图片类型
+        type_info = self.vision_client.classify_image_type(img_path)
+        
+        # 2. 如果需要生成详细描述，再调用视觉模型
         description = self.vision_client.describe_image(img_path)
 
         if not description:
@@ -179,7 +183,15 @@ class ImageService:
             token_count=len(description.split()) + len(context[:500].split()),
             position=0,
             start_char=0,
-            end_char=len(description)
+            end_char=len(description),
+            # 扩展字段：图片类型和图谱信息
+            metadata={
+                "image_type": type_info.get("type").value if type_info.get("type") else "unknown",
+                "need_graph": type_info.get("need_graph", False),
+                "graph_entities": type_info.get("entities", []),
+                "graph_relations": type_info.get("relations", []),
+                "description": type_info.get("description", description[:100])
+            }
         )
 
     def _process_table(self, item: Dict, doc_id: str) -> Optional[ChunkNode]:
