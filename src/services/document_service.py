@@ -536,9 +536,26 @@ class DocumentService:
         return self.doc_cache.get(doc_id)
 
     def list_documents(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
-        """列出文档"""
-        # TODO: 实现文档列表
-        return []
+        """列出文档（从 NebulaGraph Document 顶点读取）"""
+        if not self.nebula_client:
+            return []
+        try:
+            docs = self.nebula_client.get_documents()
+            # 映射为前端 DocListItem 格式
+            return [
+                {
+                    "doc_id": d.get("doc_id", ""),
+                    "title": d.get("title", "") or "（无标题）",
+                    "file_type": d.get("file_type", "") or "unknown",
+                    "graph_ready": bool(d.get("graph_ready", False)),
+                    "embeddings_ready": bool(d.get("embeddings_ready", False)),
+                    "embedding_task_status": d.get("embedding_task_status", "") or "",
+                }
+                for d in docs[offset : offset + limit]
+            ]
+        except Exception as e:
+            logger.warning(f"list_documents 失败: {e}")
+            return []
 
     def get_document_status(self, doc_id: str) -> Optional[Dict[str, Any]]:
         """获取文档处理状态"""

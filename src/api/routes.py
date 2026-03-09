@@ -463,6 +463,151 @@ async def query_stream(request: EnhancedQueryRequest):
 # ── 知识图谱可视化 API ──
 
 
+def _fetch_entity_graph(nebula, doc_id: str = "", limit: int = 200, include_chunk_ids: bool = False):
+    """从 NebulaGraph 获取 Entity 图谱（Enhanced-KG），供 /graph/overview 和 /graph/enhanced 复用"""
+    doc_esc = doc_id.replace('"', '\\"') if doc_id else ""
+    with nebula.get_session() as session:
+        session.execute(f"USE {nebula.space_name};")
+
+        if doc_esc:
+            yield_fields = (
+                "id(vertex) AS eid, Entity.name AS name, "
+                "Entity.entity_type AS etype, Entity.description AS `desc`"
+            )
+            if include_chunk_ids:
+                yield_fields += ", Entity.chunk_ids AS chunk_ids"
+            ent_q = (
+                f'LOOKUP ON Entity WHERE Entity.doc_id == "{doc_esc}" '
+                f'YIELD {yield_fields} | LIMIT {limit};'
+            )
+        else:
+            yield_fields = (
+                "id(vertex) AS eid, Entity.name AS name, "
+                "Entity.entity_type AS etype, Entity.description AS `desc`"
+            )
+            if include_chunk_ids:
+                yield_fields += ", Entity.chunk_ids AS chunk_ids"
+            ent_q = f'LOOKUP ON Entity YIELD {yield_fields} | LIMIT {limit};'
+
+        er = session.execute(ent_q)
+        if not er.is_succeeded():
+            return None, None, "Entity 索引未就绪或尚无数据"
+
+        ENTITY_TYPE_MAP = {
+            "PERSON": 0, "ORG": 1, "PRODUCT": 2,
+            "LOCATION": 3, "EVENT": 4, "CONCEPT": 5,
+        }
+        nodes = []
+        entity_ids = []
+        seen_eids: set = set()
+        for i in range(er.row_size()):
+            row = er.row_values(i)
+            eid = row[0].as_string()
+            if eid in seen_eids:
+                continue
+            seen_eids.add(eid)
+            name = row[1].as_string()
+            etype = row[2].as_string()
+            desc = row[3].as_string() if not row[3].is_empty() else ""
+            community = ENTITY_TYPE_MAP.get(etype, 6)
+            entity_ids.append(eid)
+            node = {
+                "id": eid,
+                "phrase": name,
+                "community": community,
+                "entity_type": etype,
+                "description": desc,
+            }
+            if include_chunk_ids and len(row) > 4:
+                try:
+                    cids = row[4].as_string() if not row[4].is_empty() else "[]"
+                    node["chunk_ids"] = cids
+                except Exception:
+                    pass
+            nodes.append(node)
+            if len(nodes) >= limit:
+                break
+
+        edges = []
+        eid_set = set(entity_ids)
+        seen_edges: set = set()
+        BATCH = 50
+        for batch_start in range(0, len(entity_ids), BATCH):
+            batch_ids = entity_ids[batch_start:batch_start + BATCH]
+            ids_str = ", ".join(f'"{eid}"' for eid in batch_ids)
+            rel_q = (
+                f"GO FROM {ids_str} OVER RELATION "
+                f"YIELD src(edge) AS source, dst(edge) AS target, "
+                f"RELATION.relation_type AS rel_type, "
+                f"RELATION.strength AS strength;"
+            )
+            rr = session.execute(rel_q)
+            if rr.is_succeeded():
+                for i in range(rr.row_size()):
+                    row = rr.row_values(i)
+                    s = row[0].as_string()
+                    t = row[1].as_string()
+                    if t not in eid_set:
+                        continue
+                    rt = row[2].as_string() if not row[2].is_empty() else "RELATED"
+                    w = row[3].as_double() if not row[3].is_empty() else 1.0
+                    key = (s, t)
+                    if key not in seen_edges:
+                        seen_edges.add(key)
+                        edges.append({"source": s, "target": t, "weight": round(w, 4), "label": rt})
+
+        type_set = set(n["entity_type"] for n in nodes)
+        return nodes, edges, type_set
+
+
+@router.get("/graph/enhanced", tags=["Graph"])
+async def graph_enhanced(doc_id: str = "", limit: int = 300):
+    """
+    增强图谱（LazyEntityBuilder 增量构建的 Entity-Relation 图）
+
+    按 plane 设计：查询时按需抽取、持久化到 NebulaGraph，越用越丰富。
+    返回节点（含 chunk_ids）、边（含关系类型），供前端可视化。
+
+    - doc_id: 文档 ID，不传则返回全部文档的实体（建议指定以查看单文档增强图谱）
+    - limit:  节点数上限，默认 300
+    """
+    try:
+        pipeline, _ = _get_pipeline()
+        nebula = pipeline.coe_engine.nebula_client
+        nodes, edges, type_set = _fetch_entity_graph(
+            nebula, doc_id=doc_id, limit=limit, include_chunk_ids=True
+        )
+        if nodes is None:
+            return {
+                "nodes": [], "edges": [],
+                "communities": [],
+                "stats": {"total_nodes": 0, "total_edges": 0, "total_communities": 0},
+                "mode": "enhanced",
+                "hint": "增强图谱暂无数据。请先选择文档进行关联型查询，系统将自动构建实体图谱。",
+            }
+
+        ENTITY_TYPE_MAP = {
+            "PERSON": 0, "ORG": 1, "PRODUCT": 2,
+            "LOCATION": 3, "EVENT": 4, "CONCEPT": 5,
+        }
+        return {
+            "nodes": nodes,
+            "edges": edges,
+            "communities": sorted(ENTITY_TYPE_MAP.get(t, 6) for t in type_set),
+            "stats": {
+                "total_nodes": len(nodes),
+                "total_edges": len(edges),
+                "total_communities": len(type_set),
+            },
+            "mode": "enhanced",
+            "doc_id": doc_id or None,
+        }
+    except Exception as e:
+        import traceback
+        logger.error(f"增强图谱查询失败: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, str(e))
+
+
 @router.get("/graph/overview", tags=["Graph"])
 async def graph_overview(doc_id: str = "", limit: int = 200, mode: str = "entity"):
     """
@@ -478,109 +623,29 @@ async def graph_overview(doc_id: str = "", limit: int = 200, mode: str = "entity
 
         # ── Entity 模式：走 Enhanced-KG ──────────────────────────────────────
         if mode == "entity":
-            with nebula.get_session() as session:
-                session.execute(f"USE {nebula.space_name};")
-
-                # 1. 取 Entity 节点
-                if doc_id:
-                    ent_q = (
-                        f'LOOKUP ON Entity WHERE Entity.doc_id == "{doc_id}" '
-                        f'YIELD id(vertex) AS eid, '
-                        f'Entity.name AS name, '
-                        f'Entity.entity_type AS etype, '
-                        f'Entity.description AS `desc` '
-                        f'| LIMIT {limit};'
-                    )
-                else:
-                    ent_q = (
-                        f'LOOKUP ON Entity '
-                        f'YIELD id(vertex) AS eid, '
-                        f'Entity.name AS name, '
-                        f'Entity.entity_type AS etype, '
-                        f'Entity.description AS `desc` '
-                        f'| LIMIT {limit};'
-                    )
-
-                er = session.execute(ent_q)
-                if not er.is_succeeded():
-                    # 索引未建好（schema 未重置）或 Entity 数据为空 → 返回空图谱
-                    logger.warning(f"Entity LOOKUP 失败（可能索引未就绪）: {er.error_msg()}")
-                    return {
-                        "nodes": [], "edges": [], "communities": [],
-                        "stats": {"total_nodes": 0, "total_edges": 0, "total_communities": 0},
-                        "mode": "entity",
-                        "hint": "Entity 索引未就绪或尚无数据，请清空数据库后重新上传文档",
-                    }
-
-                nodes = []
-                entity_ids = []
-                seen_eids: set = set()
-                ENTITY_TYPE_MAP = {
-                    "PERSON": 0, "ORG": 1, "PRODUCT": 2,
-                    "LOCATION": 3, "EVENT": 4, "CONCEPT": 5,
-                }
-                for i in range(er.row_size()):
-                    row = er.row_values(i)
-                    eid = row[0].as_string()
-                    if eid in seen_eids:
-                        continue
-                    seen_eids.add(eid)
-                    name = row[1].as_string()
-                    etype = row[2].as_string()
-                    desc = row[3].as_string() if not row[3].is_empty() else ""
-                    community = ENTITY_TYPE_MAP.get(etype, 6)
-                    entity_ids.append(eid)
-                    nodes.append({
-                        "id": eid,
-                        "phrase": name,
-                        "community": community,
-                        "entity_type": etype,
-                        "description": desc,
-                    })
-                    if len(nodes) >= limit:
-                        break
-
-                # 2. 取 RELATION 边
-                edges = []
-                eid_set = set(entity_ids)
-                seen_edges: set = set()
-                BATCH = 50
-                for batch_start in range(0, len(entity_ids), BATCH):
-                    batch_ids = entity_ids[batch_start:batch_start + BATCH]
-                    ids_str = ", ".join(f'"{eid}"' for eid in batch_ids)
-                    rel_q = (
-                        f"GO FROM {ids_str} OVER RELATION "
-                        f"YIELD src(edge) AS source, dst(edge) AS target, "
-                        f"RELATION.relation_type AS rel_type, "
-                        f"RELATION.strength AS strength;"
-                    )
-                    rr = session.execute(rel_q)
-                    if rr.is_succeeded():
-                        for i in range(rr.row_size()):
-                            row = rr.row_values(i)
-                            s = row[0].as_string()
-                            t = row[1].as_string()
-                            if t not in eid_set:
-                                continue
-                            rt = row[2].as_string() if not row[2].is_empty() else "RELATED"
-                            w = row[3].as_double() if not row[3].is_empty() else 1.0
-                            key = (s, t)
-                            if key not in seen_edges:
-                                seen_edges.add(key)
-                                edges.append({"source": s, "target": t, "weight": round(w, 4), "label": rt})
-
-                type_set = set(n["entity_type"] for n in nodes)
+            nodes, edges, type_set = _fetch_entity_graph(nebula, doc_id=doc_id, limit=limit)
+            if nodes is None:
                 return {
-                    "nodes": nodes,
-                    "edges": edges,
-                    "communities": sorted(ENTITY_TYPE_MAP.get(t, 6) for t in type_set),
-                    "stats": {
-                        "total_nodes": len(nodes),
-                        "total_edges": len(edges),
-                        "total_communities": len(type_set),
-                    },
+                    "nodes": [], "edges": [], "communities": [],
+                    "stats": {"total_nodes": 0, "total_edges": 0, "total_communities": 0},
                     "mode": "entity",
+                    "hint": "Entity 索引未就绪或尚无数据，请清空数据库后重新上传文档",
                 }
+            ENTITY_TYPE_MAP = {
+                "PERSON": 0, "ORG": 1, "PRODUCT": 2,
+                "LOCATION": 3, "EVENT": 4, "CONCEPT": 5,
+            }
+            return {
+                "nodes": nodes,
+                "edges": edges,
+                "communities": sorted(ENTITY_TYPE_MAP.get(t, 6) for t in type_set),
+                "stats": {
+                    "total_nodes": len(nodes),
+                    "total_edges": len(edges),
+                    "total_communities": len(type_set),
+                },
+                "mode": "entity",
+            }
 
         # ── Concept 模式：走 SpaCy 共现图（原逻辑）────────────────────────────
         with nebula.get_session() as session:

@@ -12,12 +12,32 @@
   - factual 查询不触发（成本节省）
   - global 查询不触发（用社区导航代替）
   - 只有 relational 且 enable_lazy_enhance=True 时才触发
+
+查询相似度复用：
+  - 若当前查询与近期查询语义相似（embedding 余弦 > 0.92），直接复用抽取结果，跳过 LLM
+  - 用于连续追问、相似问题等场景，显著降低延迟
 """
 import json
 import re
+from collections import deque
 from typing import Optional, Dict, Any, List
 
+import numpy as np
+
 from src.utils.logger import logger
+
+# 查询相似度缓存：key=doc_id, value=deque of (embedding, extraction)
+_EXTRACTION_CACHE: Dict[str, deque] = {}
+_CACHE_MAX_SIZE = 20
+_SIMILARITY_THRESHOLD = 0.92
+
+
+def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+    """余弦相似度"""
+    na, nb = np.linalg.norm(a), np.linalg.norm(b)
+    if na < 1e-9 or nb < 1e-9:
+        return 0.0
+    return float(np.dot(a, b) / (na * nb))
 
 
 # 实体抽取 Prompt
@@ -50,6 +70,54 @@ class LazyEnhancer:
         self.vector_client = vector_client
         self.nebula_client = nebula_client
         self.entity_types = entity_types or ["PERSON", "ORG", "PRODUCT", "LOCATION", "EVENT", "CONCEPT"]
+
+    def _get_cached_extraction(
+        self, query_embedding, doc_id: Optional[str]
+    ) -> Optional[Dict]:
+        """若当前查询与近期查询语义相似，复用抽取结果"""
+        if query_embedding is None:
+            return None
+        try:
+            emb = np.array(query_embedding, dtype=np.float32)
+            if emb.size < 10:
+                return None
+        except Exception:
+            return None
+
+        cache_key = doc_id or "_global"
+        if cache_key not in _EXTRACTION_CACHE:
+            return None
+
+        best_sim, best_res = 0.0, None
+        for cached_emb, cached_res in _EXTRACTION_CACHE[cache_key]:
+            try:
+                cemb = np.array(cached_emb, dtype=np.float32)
+                if cemb.shape != emb.shape:
+                    continue
+                sim = _cosine_sim(emb, cemb)
+                if sim > best_sim:
+                    best_sim, best_res = sim, cached_res
+            except Exception:
+                continue
+
+        if best_sim >= _SIMILARITY_THRESHOLD and best_res:
+            logger.info(
+                f"LazyEnhancer 查询相似复用: sim={best_sim:.2f}, "
+                f"entities={best_res.get('entities', [])[:3]}"
+            )
+            return best_res
+        return None
+
+    def _put_cached_extraction(
+        self, query_embedding, doc_id: Optional[str], extraction: Dict
+    ):
+        """将抽取结果加入缓存"""
+        if query_embedding is None:
+            return
+        cache_key = doc_id or "_global"
+        if cache_key not in _EXTRACTION_CACHE:
+            _EXTRACTION_CACHE[cache_key] = deque(maxlen=_CACHE_MAX_SIZE)
+        _EXTRACTION_CACHE[cache_key].append((list(query_embedding), extraction))
 
     def build(
         self,
@@ -119,8 +187,13 @@ class LazyEnhancer:
             "graph_entities": [],
         }
 
-        # Step 1: 用 LLM 抽取实体和关键词
-        extraction = self._extract_entities(query, seed_chunks or [])
+        # Step 1: 用 LLM 抽取实体和关键词（查询相似时复用缓存，跳过 LLM）
+        extraction = self._get_cached_extraction(query_embedding, doc_id)
+        if extraction is None:
+            extraction = self._extract_entities(query, seed_chunks or [])
+            if query_embedding is not None:
+                self._put_cached_extraction(query_embedding, doc_id, extraction)
+
         result["entities"] = extraction.get("entities", [])
         result["keywords"] = extraction.get("keywords", [])
         expanded_query = extraction.get("expanded_query", query)
@@ -132,24 +205,40 @@ class LazyEnhancer:
         )
 
         # Step 2: 用扩展查询在 Milvus 中二次关键词检索
+        existing_cids = {c.get("chunk_id", "") for c in (seed_chunks or [])}
         if (result["entities"] or result["keywords"]) and self.vector_client:
             extra = self._keyword_search(
                 entities=result["entities"],
                 keywords=result["keywords"],
                 doc_id=doc_id,
-                existing_chunk_ids={c.get("chunk_id", "") for c in (seed_chunks or [])},
+                existing_chunk_ids=existing_cids,
                 top_k=top_k,
             )
+            for ec in extra:
+                existing_cids.add(ec.get("chunk_id", ""))
             result["extra_chunks"] = extra
             if extra:
                 logger.info(f"LazyEnhancer 扩展检索: +{len(extra)} 条新 chunks")
 
-        # Step 3: 在 NebulaGraph 中查找实体的 Entity→Relation 邻居
+        # Step 3: 图谱遍历（Entity→Relation 邻居）→ 用邻居实体 chunk_ids 拉取 chunks 增强检索
         if result["entities"] and self.nebula_client:
             graph_ents = self._graph_entity_lookup(result["entities"], doc_id)
             result["graph_entities"] = graph_ents
-            if graph_ents:
-                logger.info(f"LazyEnhancer 图谱实体: {len(graph_ents)} 条")
+            logger.info(
+                f"LazyEnhancer 图谱遍历: entities={len(result['entities'])}, "
+                f"graph_relations={len(graph_ents)}"
+            )
+
+            # Step 4: 用子图遍历结果增强检索（按 plane 设计：用子图做图谱遍历 → 增强检索）
+            graph_chunks = self._fetch_chunks_by_graph_entities(
+                entities=result["entities"],
+                graph_entities=graph_ents,
+                doc_id=doc_id,
+                existing_chunk_ids=existing_cids,
+            )
+            if graph_chunks:
+                result["extra_chunks"].extend(graph_chunks)
+                logger.info(f"LazyEnhancer 子图增强检索: +{len(graph_chunks)} 条 chunks")
 
         return result
 
@@ -269,6 +358,47 @@ class LazyEnhancer:
             logger.warning(f"LazyEnhancer 图谱实体查询失败: {e}")
 
         return result_entities
+
+    def _fetch_chunks_by_graph_entities(
+        self,
+        entities: List[str],
+        graph_entities: List[dict],
+        doc_id: Optional[str],
+        existing_chunk_ids: set,
+    ) -> List[dict]:
+        """用子图遍历得到的实体名，从 Nebula 查 chunk_ids，再从 Milvus 拉取 chunks（plane 设计）"""
+        if not self.nebula_client or not self.vector_client:
+            return []
+
+        # 收集所有相关实体名：查询实体 + 邻居实体
+        entity_names = list(entities[:4])
+        for ge in graph_entities:
+            related = ge.get("related", "").strip()
+            if related and related not in entity_names:
+                entity_names.append(related)
+
+        chunk_ids = self.nebula_client.get_entity_chunk_ids(
+            entity_names=entity_names,
+            doc_id=doc_id or "",
+        )
+        logger.info(
+            f"LazyEnhancer 子图增强: entity_names={entity_names[:6]}, "
+            f"chunk_ids_from_kg={len(chunk_ids) if chunk_ids else 0}, existing={len(existing_chunk_ids)}"
+        )
+        if not chunk_ids:
+            return []
+
+        # 过滤已存在的
+        needed = [cid for cid in chunk_ids if cid and cid not in existing_chunk_ids]
+        if not needed:
+            logger.info("LazyEnhancer 子图增强: 所有 chunk_ids 已在 existing 中，无新增")
+            return []
+
+        chunks = self.vector_client.query_by_chunk_ids(needed)
+        logger.info(f"LazyEnhancer 子图增强: needed={len(needed)}, milvus_hits={len(chunks)}")
+        for c in chunks:
+            existing_chunk_ids.add(c.get("chunk_id", ""))
+        return chunks
 
     def extract_keywords(self, query: str) -> list:
         """提取关键词（公共接口）"""

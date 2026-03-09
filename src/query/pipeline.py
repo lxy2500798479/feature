@@ -118,16 +118,18 @@ class QueryPipeline:
             result.latency_breakdown = latency
             return result
 
-        # 4. Lazy Entity Build（仅 relational 查询的持久化实体图谱）
-        # 首次查询时从 chunks 抽取实体并存储，后续查询直接使用
+        # 4. Lazy Entity Build（仅 relational 查询，按 plane 设计：增量扩展 + 子图缓存）
+        # 每次从 CoE 召回的 chunks 抽取新实体，合并到 NebulaGraph，越用越快
         entity_graph_result = None
         if enable_entity_persist and doc_id and self.lazy_enhancer and query_type == "relational":
             t0 = time.time()
             try:
-                # 检查是否已有持久化的实体，没有则抽取并存储
+                # 合并 vector + graph chunks 供增量抽取（plane：基于初步召回的 Chunk）
+                vcids = {c.get("chunk_id", "") for c in vector_chunks}
+                build_chunks = vector_chunks + [c for c in graph_chunks if c.get("chunk_id") and c.get("chunk_id") not in vcids]
                 entity_graph_result = self.lazy_enhancer.build(
                     doc_id=doc_id,
-                    chunks=vector_chunks,
+                    chunks=build_chunks,
                     force_rebuild=False,
                 )
                 if entity_graph_result:
@@ -143,7 +145,7 @@ class QueryPipeline:
             latency["entity_graph"] = round(time.time() - t0, 3)
 
         # 5. Lazy Enhance（仅 relational 类型 + enable_lazy_enhance=True）
-        lazy_entities = []
+        graph_entities = []
         if (
             query_type == "relational"
             and enable_lazy_enhance
@@ -159,9 +161,8 @@ class QueryPipeline:
                     top_k=5,
                 )
                 extra_chunks = enhance_result.get("extra_chunks", [])
-                lazy_entities = enhance_result.get("graph_entities", [])
+                graph_entities = enhance_result.get("graph_entities", [])
                 if extra_chunks:
-                    # 把扩展 chunks 追加到 vector_chunks（去重）
                     existing_cids = {c.get("chunk_id", "") for c in vector_chunks}
                     for ec in extra_chunks:
                         if ec.get("chunk_id", "") not in existing_cids:
@@ -173,9 +174,15 @@ class QueryPipeline:
                 logger.warning(f"[{trace_id}] Lazy Enhance 失败（跳过）: {e}")
             latency["lazy_enhance"] = round(time.time() - t0, 3)
 
-        # 6. 答案合成
+        # 6. 答案合成（graph_ctx 含 graph_chunks、communities、graph_entities，按 plane 设计注入）
         t0 = time.time()
-        graph_ctx = {"chunks": graph_chunks, "communities": community_ctx} if (graph_chunks or community_ctx) else None
+        graph_ctx = None
+        if graph_chunks or community_ctx or graph_entities:
+            graph_ctx = {
+                "chunks": graph_chunks,
+                "communities": community_ctx,
+                "graph_entities": graph_entities,
+            }
 
         if stream:
             # 流式模式：把生成器挂到 _answer_stream，routes 负责逐 token 发送

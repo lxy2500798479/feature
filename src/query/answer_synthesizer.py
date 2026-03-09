@@ -18,10 +18,20 @@ def _build_prompt(query: str, vector_context: Optional[List[dict]], graph_contex
     if graph_context:
         graph_chunks = graph_context.get("chunks", [])
         communities = graph_context.get("communities", [])
+        graph_entities = graph_context.get("graph_entities", [])
         if graph_chunks:
             context_parts.append("\n## 图谱关联内容:\n")
             for item in graph_chunks[:3]:
                 context_parts.append(f"- {item.get('text', '')[:300]}")
+        if graph_entities:
+            context_parts.append("\n## 实体关系（子图遍历）:\n")
+            for ge in graph_entities[:6]:
+                entity = ge.get("entity", "")
+                related = ge.get("related", "")
+                rel_type = ge.get("relation_type", "")
+                desc = ge.get("description", "")[:100]
+                if entity and related:
+                    context_parts.append(f"- {entity} --[{rel_type}]--> {related}: {desc}")
         if communities:
             context_parts.append("\n## 社区摘要:\n")
             for c in communities[:3]:

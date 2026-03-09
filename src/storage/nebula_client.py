@@ -3,6 +3,7 @@ NebulaGraph 客户端
 """
 from contextlib import contextmanager
 from typing import List, Dict, Optional, Any
+import json
 import nebula3
 from nebula3.Config import Config
 from nebula3.gclient.net import ConnectionPool
@@ -368,21 +369,65 @@ class NebulaClient:
                 result = session.execute('MATCH (d:Document) RETURN d;')
 
             documents = []
+            seen_doc_ids = set()
             if result.is_succeeded():
                 for row in result.rows():
                     doc_value = row.values[0]
                     doc_data = self._parse_vertex_props(doc_value)
-                    if doc_data and "doc_id" in doc_data:
-                        documents.append({
-                            "doc_id": doc_data.get("doc_id", ""),
-                            "title": doc_data.get("title", ""),
-                            "file_path": doc_data.get("file_path", ""),
-                            "file_type": doc_data.get("file_type", ""),
-                            "graph_ready": doc_data.get("graph_ready", False),
-                            "embeddings_ready": doc_data.get("embeddings_ready", False),
-                            "embedding_task_status": doc_data.get("embedding_task_status", ""),
-                        })
+                    # 仅保留 Document 节点（有 file_path 或 graph_ready 的是 Document，Section/Chunk 等无此字段）
+                    if not doc_data or "doc_id" not in doc_data:
+                        continue
+                    if "file_path" not in doc_data and "graph_ready" not in doc_data:
+                        continue
+                    doc_id = doc_data.get("doc_id", "")
+                    if not doc_id or doc_id in seen_doc_ids:
+                        continue
+                    seen_doc_ids.add(doc_id)
+                    documents.append({
+                        "doc_id": doc_id,
+                        "title": doc_data.get("title", ""),
+                        "file_path": doc_data.get("file_path", ""),
+                        "file_type": doc_data.get("file_type", ""),
+                        "graph_ready": doc_data.get("graph_ready", False),
+                        "embeddings_ready": doc_data.get("embeddings_ready", False),
+                        "embedding_task_status": doc_data.get("embedding_task_status", ""),
+                    })
             return documents
+
+    def get_documents_for_retrieval(self) -> List[Dict]:
+        """获取文档列表（含 title、summary）用于 CoE Step1 文档级检索
+        
+        Returns:
+            [{"doc_id": ..., "title": ..., "summary": ...}, ...]
+        """
+        with self.get_session() as session:
+            session.execute(f"USE {self.space_name};")
+            result = session.execute("SCAN VERTEX WITH LIMIT 200 YIELD VERTEX AS v;")
+            if not result.is_succeeded():
+                result = session.execute("MATCH (d:Document) RETURN d;")
+            if not result.is_succeeded():
+                return []
+
+            seen = set()
+            docs = []
+            for row in result.rows():
+                try:
+                    doc_value = row.values[0]
+                    doc_data = self._parse_vertex_props(doc_value)
+                    if not doc_data:
+                        continue
+                    doc_id = doc_data.get("doc_id", "")
+                    # 仅保留 Document 节点（有 file_path 或 graph_ready 的是 Document）
+                    if doc_id and ("file_path" in doc_data or "graph_ready" in doc_data) and doc_id not in seen:
+                        seen.add(doc_id)
+                        docs.append({
+                            "doc_id": doc_id,
+                            "title": doc_data.get("title", "") or "",
+                            "summary": doc_data.get("summary", "") or "",
+                        })
+                except Exception:
+                    pass
+            return docs
 
     def update_document(self, doc_id: str, properties: Dict):
         """更新文档属性（使用 NebulaGraph 正确语法 UPDATE VERTEX ON Tag）"""
@@ -745,8 +790,12 @@ class NebulaClient:
                             summary_v = row.values[2]
                             order_v = row.values[3]
 
-                            sid = sid_v.get_sVal() if sid_v.getType() == 5 else b""
-                            sid = sid.decode() if isinstance(sid, bytes) else sid
+                            # id(vertex) 可能返回多种类型，兼容解析
+                            if sid_v.getType() == 5:
+                                s = sid_v.get_sVal()
+                                sid = s.decode("utf-8") if isinstance(s, bytes) else (s or "")
+                            else:
+                                sid = str(sid_v) if sid_v else ""
 
                             title = title_v.get_sVal() if title_v.getType() == 5 else b""
                             title = title.decode() if isinstance(title, bytes) else title
@@ -811,6 +860,47 @@ class NebulaClient:
                 if not r.is_succeeded():
                     self.logger.warning(f"RELATION 边插入失败 {src}->{dst}: {r.error_msg()}")
 
+    def update_entity_chunk_ids(self, entity_id: str, chunk_ids_json: str):
+        """更新实体的 chunk_ids（用于增量扩展时合并）"""
+        if not entity_id or not chunk_ids_json:
+            return
+        try:
+            chunk_ids_escaped = chunk_ids_json.replace('"', '\\"').replace('\n', ' ')
+            with self.get_session() as session:
+                session.execute(f"USE {self.space_name};")
+                q = f'UPDATE VERTEX ON Entity "{entity_id}" SET chunk_ids = "{chunk_ids_escaped}";'
+                r = session.execute(q)
+                if not r.is_succeeded():
+                    self.logger.warning(f"Entity chunk_ids 更新失败 {entity_id}: {r.error_msg()}")
+        except Exception as e:
+            self.logger.warning(f"update_entity_chunk_ids 失败: {e}")
+
+    def clear_entities_by_doc_id(self, doc_id: str):
+        """删除指定文档的所有 Entity 顶点及其边（用于 force_rebuild）"""
+        if not doc_id:
+            return
+        try:
+            doc_esc = doc_id.replace('"', '\\"')
+            with self.get_session() as session:
+                session.execute(f"USE {self.space_name};")
+                lookup_q = (
+                    f'LOOKUP ON Entity WHERE Entity.doc_id == "{doc_esc}" '
+                    f'YIELD id(vertex) AS vid | LIMIT 1000;'
+                )
+                lr = session.execute(lookup_q)
+                if not lr.is_succeeded() or lr.row_size() == 0:
+                    return
+                vids = []
+                for row in lr.rows():
+                    v = row.values[0]
+                    if v.getType() == 5:
+                        p = v.get_sVal()
+                        vids.append(p.decode() if isinstance(p, bytes) else str(p))
+                for vid in vids:
+                    session.execute(f'DELETE VERTEX "{vid}" WITH EDGE;')
+        except Exception as e:
+            self.logger.warning(f"clear_entities_by_doc_id 失败: {e}")
+
     def get_entity_neighbors(self, entity_name: str, doc_id: str = "", hops: int = 2) -> List[Dict]:
         """查询实体的 N 跳邻居（用于 Lazy Enhancer 图遍历）"""
         results = []
@@ -873,3 +963,50 @@ class NebulaClient:
         except Exception as e:
             self.logger.warning(f"get_entity_neighbors 失败: {e}")
         return results
+
+    def get_entity_chunk_ids(self, entity_names: List[str], doc_id: str = "") -> List[str]:
+        """根据实体名获取其关联的 chunk_ids（用于子图增强检索）
+
+        遍历 entity_names，对每个实体 LOOKUP 获取 chunk_ids 属性，
+        解析 JSON 后合并去重返回。
+        """
+        chunk_ids = []
+        seen_entities = set()
+        seen_cids = set()
+        for name in entity_names[:8]:
+            if not name or name in seen_entities:
+                continue
+            seen_entities.add(name)
+            try:
+                with self.get_session() as session:
+                    session.execute(f"USE {self.space_name};")
+                    name_esc = self._escape_nebula_string(name)
+                    if doc_id:
+                        q = (
+                            f'LOOKUP ON Entity WHERE Entity.name == "{name_esc}" '
+                            f'AND Entity.doc_id == "{doc_id}" '
+                            f'YIELD Entity.chunk_ids AS cids;'
+                        )
+                    else:
+                        q = (
+                            f'LOOKUP ON Entity WHERE Entity.name == "{name_esc}" '
+                            f'YIELD Entity.chunk_ids AS cids;'
+                        )
+                    r = session.execute(q)
+                    if r.is_succeeded():
+                        for row in r.rows():
+                            val = row.values[0]
+                            if val and val.getType() == 5:
+                                s = val.get_sVal()
+                                raw = s.decode("utf-8") if isinstance(s, bytes) else (s or "[]")
+                                try:
+                                    ids = json.loads(raw) if isinstance(raw, str) else raw
+                                    for cid in (ids or []):
+                                        if cid and cid not in seen_cids:
+                                            chunk_ids.append(cid)
+                                            seen_cids.add(cid)
+                                except Exception:
+                                    pass
+            except Exception as e:
+                self.logger.debug(f"get_entity_chunk_ids {name} 失败: {e}")
+        return chunk_ids

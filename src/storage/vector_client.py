@@ -160,6 +160,7 @@ class MilvusClient:
         self,
         query_vector: List[float],
         doc_id: Optional[str] = None,
+        doc_ids: Optional[List[str]] = None,
         top_k: int = 10,
         section_ids: Optional[List[str]] = None,
     ) -> List[Dict]:
@@ -167,7 +168,8 @@ class MilvusClient:
         
         Args:
             query_vector: 查询向量
-            doc_id: 按文档 ID 过滤
+            doc_id: 按单个文档 ID 过滤
+            doc_ids: 按多个文档 ID 过滤（与 doc_id 二选一）
             top_k: 返回条数
             section_ids: 按 Section ID 列表过滤（CoE Step 3 精确检索用）
         """
@@ -177,11 +179,13 @@ class MilvusClient:
         search_params = {"metric_type": "COSINE", "params": {"nprobe": 10}}
 
         if section_ids:
-            # 在指定 sections 内检索
             ids_quoted = ", ".join(f'"{sid}"' for sid in section_ids)
             expr = f"section_id in [{ids_quoted}]"
         elif doc_id:
             expr = f'doc_id == "{doc_id}"'
+        elif doc_ids:
+            ids_quoted = ", ".join(f'"{did}"' for did in doc_ids)
+            expr = f"doc_id in [{ids_quoted}]"
         else:
             expr = None
         
@@ -205,6 +209,36 @@ class MilvusClient:
             }
             for r in results[0]
         ]
+
+    def query_by_chunk_ids(
+        self,
+        chunk_ids: List[str],
+    ) -> List[Dict]:
+        """根据 chunk_id 列表查询 chunks（用于子图增强检索）"""
+        if not self.collection or not chunk_ids:
+            return []
+        try:
+            ids_quoted = ", ".join(f'"{str(cid).replace(chr(34), "")}"' for cid in chunk_ids[:20])
+            expr = f"chunk_id in [{ids_quoted}]"
+            hits = self.collection.query(
+                expr=expr,
+                output_fields=["chunk_id", "doc_id", "section_id", "text"],
+                limit=len(chunk_ids) + 10,
+            )
+            return [
+                {
+                    "chunk_id": h.get("chunk_id", ""),
+                    "doc_id": h.get("doc_id", ""),
+                    "section_id": h.get("section_id", ""),
+                    "text": h.get("text", ""),
+                    "score": 0.0,
+                    "source": "graph_traversal",
+                }
+                for h in (hits or [])
+            ]
+        except Exception as e:
+            logger.warning(f"query_by_chunk_ids 失败: {e}")
+            return []
 
     def reset_collection(self):
         """删除并重建 collection"""

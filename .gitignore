@@ -2,3 +2,4 @@ mockData/
 .venv
 .idea/
 uploads/
+__pycache__/

@@ -1,10 +1,10 @@
 """
 CoE (Chain of Exploration) 导航引擎
 
-完整三步 CoE 导航:
-  Step 1: 全局向量粗检索 → 候选 chunks（快速锁定相关区域）
-  Step 2: Section Summary 精排 → 锁定 Top-N 最相关 Section（提升召回率）
-  Step 3: 在精排 Section 内二次向量检索 → 高精度 chunks
+按设计文档：Meta-KG 优先，自上而下检索
+  Step 1: find_relevant_documents(query) → 候选文档列表（Meta-KG）
+  Step 2: drill_down_to_sections(docs) → 用 Section Summary 精排（Meta-KG）
+  Step 3: extract_chunks(sections) → 在精排 Section 内向量检索
 """
 from typing import Optional, List, Dict, Any
 import time
@@ -13,7 +13,7 @@ from src.utils.logger import logger
 
 
 class CoEEngine:
-    """CoE 引擎 - 三步层级导航检索"""
+    """CoE 引擎 - Meta-KG 优先的三步层级导航检索"""
 
     def __init__(
         self,
@@ -34,14 +34,14 @@ class CoEEngine:
         use_graph: bool = False,
         use_community: bool = False,
     ) -> Dict[str, Any]:
-        """CoE 三步层级导航检索
+        """CoE 三步层级导航检索（设计：Meta-KG 优先）
 
         Returns:
             {
-                "vector_chunks": [...],  # Step 1 + Step 3 的 chunks
-                "graph_chunks": [...],   # 图谱邻居补充内容
-                "community_context": [] # 社区摘要（全局型查询用）
-                "retrieval_paths": [...] # 检索路径（可溯源）
+                "vector_chunks": [...],
+                "graph_chunks": [...],
+                "community_context": [],
+                "retrieval_paths": [...]
             }
         """
         t0 = time.time()
@@ -55,60 +55,60 @@ class CoEEngine:
         if self.vector_client is None or query_embedding is None:
             return results
 
-        # ── Step 1: 全局向量粗检索，快速定位候选区域 ──────────────────────
-        try:
-            coarse_k = min(top_k * 3, 30)  # 粗检索取更多，再精排
-            coarse_results = self.vector_client.search(
-                query_vector=query_embedding,
-                doc_id=doc_id,
-                top_k=coarse_k,
-            )
-            logger.info(f"CoE Step1 粗检索: {len(coarse_results)} 条 (耗时: {time.time()-t0:.2f}s)")
-        except Exception as e:
-            logger.warning(f"CoE Step1 粗检索失败: {e}")
-            coarse_results = []
+        # ── Step 1: find_relevant_documents（Meta-KG 优先）────────────────
+        doc_ids = self._find_relevant_documents(query=query, doc_id=doc_id)
+        logger.info(f"CoE Step1 文档定位: {len(doc_ids)} 个文档 (耗时: {time.time()-t0:.2f}s)")
 
-        if not coarse_results:
-            return results
-
-        # ── Step 2: Section Summary 精排 → 锁定 Top Section ──────────────
+        # ── Step 2: drill_down_to_sections（Section Summary 精排）─────────
         top_section_ids = self._drill_down_sections(
             query=query,
-            coarse_chunks=coarse_results,
-            doc_id=doc_id,
+            doc_ids=doc_ids,
             top_n=5,
         )
+        logger.info(
+            f"CoE Step2 Section 精排: {len(top_section_ids)} 个 Section "
+            f"(耗时: {time.time()-t0:.2f}s)"
+        )
 
-        # ── Step 3: 在精排 Section 内做精确向量检索 ────────────────────────
-        if top_section_ids:
-            try:
-                precise_results = self.vector_client.search(
-                    query_vector=query_embedding,
-                    section_ids=top_section_ids,
-                    top_k=top_k,
-                )
-                results["vector_chunks"] = precise_results
-                results["retrieval_paths"].append(
-                    f"coe_3step(coarse={len(coarse_results)},sections={len(top_section_ids)},precise={len(precise_results)})"
-                )
-                logger.info(
-                    f"CoE Step3 精确检索: {len(precise_results)} 条 "
-                    f"(sections={len(top_section_ids)}, 耗时: {time.time()-t0:.2f}s)"
-                )
-            except Exception as e:
-                logger.warning(f"CoE Step3 精确检索失败，降级用粗检索结果: {e}")
-                results["vector_chunks"] = coarse_results[:top_k]
-                results["retrieval_paths"].append(f"vector_search(top_k={top_k},fallback)")
-        else:
-            # Section 精排失败，直接用粗检索 top_k 结果
-            results["vector_chunks"] = coarse_results[:top_k]
-            results["retrieval_paths"].append(f"vector_search(top_k={top_k})")
-            logger.info(f"CoE 使用粗检索结果（无 Section 精排）: {len(results['vector_chunks'])} 条")
+        # ── Step 3: extract_chunks（在精排 Section 内向量检索）─────────────
+        try:
+            filter_doc_id = doc_ids[0] if len(doc_ids) == 1 else None
+            filter_doc_ids = doc_ids if len(doc_ids) > 1 else None
+            filter_section_ids = top_section_ids if top_section_ids else None
 
-        # ── 图谱遍历（关联型查询）────────────────────────────────────────
-        if use_graph and self.nebula_client and results["vector_chunks"]:
+            search_kwargs = {
+                "query_vector": query_embedding,
+                "top_k": top_k,
+            }
+            if filter_section_ids:
+                search_kwargs["section_ids"] = filter_section_ids
+            elif filter_doc_id:
+                search_kwargs["doc_id"] = filter_doc_id
+            elif filter_doc_ids:
+                search_kwargs["doc_ids"] = filter_doc_ids
+
+            vector_results = self.vector_client.search(**search_kwargs)
+            results["vector_chunks"] = vector_results
+            path_desc = (
+                f"coe_meta_kg(docs={len(doc_ids)},sections={len(top_section_ids) or 0},chunks={len(vector_results)})"
+                if top_section_ids
+                else f"coe_fallback(docs={len(doc_ids)},chunks={len(vector_results)})"
+            )
+            results["retrieval_paths"].append(path_desc)
+            logger.info(
+                f"CoE Step3 向量检索: {len(vector_results)} 条 "
+                f"(耗时: {time.time()-t0:.2f}s)"
+            )
+        except Exception as e:
+            logger.warning(f"CoE Step3 向量检索失败: {e}")
+
+        # ── 图谱遍历（关联型：Section 内邻居扩展）──────────────────────────
+        if use_graph and results["vector_chunks"]:
             try:
-                graph_chunks = self._graph_navigate(results["vector_chunks"], doc_id)
+                graph_chunks = self._graph_navigate(
+                    results["vector_chunks"],
+                    doc_id or (doc_ids[0] if doc_ids else None),
+                )
                 results["graph_chunks"] = graph_chunks
                 results["retrieval_paths"].append("graph_traversal")
                 logger.info(f"CoE 图谱遍历: {len(graph_chunks)} 条结果")
@@ -118,7 +118,9 @@ class CoEEngine:
         # ── 社区导航（全局型查询）────────────────────────────────────────
         if use_community and self.nebula_client:
             try:
-                community_ctx = self._community_navigate(doc_id)
+                community_ctx = self._community_navigate(
+                    doc_id or (doc_ids[0] if doc_ids else None)
+                )
                 results["community_context"] = community_ctx
                 results["retrieval_paths"].append("community_navigation")
                 logger.info(f"CoE 社区导航: {len(community_ctx)} 条社区摘要")
@@ -127,84 +129,93 @@ class CoEEngine:
 
         return results
 
+    def _find_relevant_documents(
+        self,
+        query: str,
+        doc_id: Optional[str],
+        top_n: int = 10,
+    ) -> List[str]:
+        """Step 1: 从 Meta-KG 找相关文档（设计：先查 Meta-KG）
+
+        - 若指定 doc_id：直接返回 [doc_id]
+        - 否则：从 NebulaGraph 获取文档，用 query 与 title/summary 匹配打分，返回 top_n
+        - 无 NebulaGraph 时：返回 []，后续 Step3 将做全库向量检索
+        """
+        if doc_id:
+            return [doc_id]
+
+        if not self.nebula_client:
+            return []
+
+        try:
+            docs = self.nebula_client.get_documents_for_retrieval()
+            if not docs:
+                return []
+
+            scored = self._score_docs_by_query(query, docs)
+            return [d["doc_id"] for d in scored[:top_n]]
+        except Exception as e:
+            logger.warning(f"CoE Step1 文档检索失败: {e}")
+            return []
+
+    def _score_docs_by_query(self, query: str, docs: List[dict]) -> List[dict]:
+        """用 query 关键词与 Document title/summary 匹配打分"""
+        query_tokens = self._extract_query_tokens(query)
+        scored = []
+        for doc in docs:
+            text = ((doc.get("title", "") or "") + " " + (doc.get("summary", "") or "")).lower()
+            kw_hits = sum(1 for t in query_tokens if t in text)
+            scored.append({**doc, "_score": kw_hits})
+        return sorted(scored, key=lambda x: x["_score"], reverse=True)
+
     def _drill_down_sections(
         self,
         query: str,
-        coarse_chunks: List[dict],
-        doc_id: Optional[str],
+        doc_ids: List[str],
         top_n: int = 5,
     ) -> List[str]:
-        """Step 2: 用 Section Summary 精排，返回 Top-N Section IDs
+        """Step 2: 用 Section Summary 精排（设计：Meta-KG 自上而下）
 
-        策略：
-        1. 从粗检索结果提取涉及的 section_id 集合
-        2. 从 NebulaGraph 读取这些 Section 的 summary
-        3. 用关键词匹配对 Section 打分（简单高效，无需额外 embedding）
-        4. 若 NebulaGraph 无 summary，直接按命中频率排序
+        从 NebulaGraph 获取文档的 Section 列表，用 query 与 title/summary 匹配打分，
+        返回 top_n 个 section_id。不依赖向量检索结果。
         """
-        # 从粗检索结果收集候选 section_id
-        section_hit_count: Dict[str, int] = {}
-        for chunk in coarse_chunks:
-            sid = chunk.get("section_id", "")
-            if not sid and "_chunk_" in chunk.get("chunk_id", ""):
-                sid = chunk["chunk_id"].rsplit("_chunk_", 1)[0]
-            if sid:
-                section_hit_count[sid] = section_hit_count.get(sid, 0) + 1
-
-        if not section_hit_count:
+        if not self.nebula_client or not doc_ids:
             return []
 
-        # 尝试从 NebulaGraph 获取 Section Summary 做精排
-        if self.nebula_client and doc_id:
+        all_sections = []
+        for did in doc_ids:
             try:
-                sections = self.nebula_client.get_sections_with_summaries(doc_id)
-                if sections:
-                    # 用候选 section_id 过滤
-                    candidate_sections = [
-                        s for s in sections if s["section_id"] in section_hit_count
-                    ]
-                    if candidate_sections:
-                        scored = self._score_sections_by_query(query, candidate_sections, section_hit_count)
-                        top_ids = [s["section_id"] for s in scored[:top_n]]
-                        logger.info(
-                            f"CoE Step2 Section 精排: {len(candidate_sections)} 个候选 → top {len(top_ids)} 个"
-                        )
-                        return top_ids
+                sections = self.nebula_client.get_sections_with_summaries(did)
+                for s in sections:
+                    s["doc_id"] = did
+                    all_sections.append(s)
             except Exception as e:
-                logger.warning(f"CoE Step2 Section 精排失败: {e}")
+                logger.debug(f"获取文档 {did} 的 sections 失败: {e}")
 
-        # 降级：按命中频率排序
-        sorted_sections = sorted(section_hit_count.items(), key=lambda x: x[1], reverse=True)
-        return [sid for sid, _ in sorted_sections[:top_n]]
+        if not all_sections:
+            return []
 
-    def _score_sections_by_query(
-        self,
-        query: str,
-        sections: List[dict],
-        hit_counts: Dict[str, int],
-    ) -> List[dict]:
-        """用关键词匹配对 Section 打分（summary 相关性 + 命中频率）"""
-        query_tokens = set(query.lower().replace("，", " ").replace("。", " ").split())
-        # 过滤停用词
-        stopwords = {"是", "的", "了", "吗", "啊", "呢", "什么", "如何", "哪些"}
-        query_tokens -= stopwords
-        query_tokens = {t for t in query_tokens if len(t) >= 2}
+        scored = self._score_sections_by_query(query, all_sections)
+        return [s["section_id"] for s in scored[:top_n]]
 
+    def _score_sections_by_query(self, query: str, sections: List[dict]) -> List[dict]:
+        """用 query 关键词与 Section title/summary 匹配打分"""
+        query_tokens = self._extract_query_tokens(query)
         scored = []
         for sec in sections:
             summary = (sec.get("summary", "") or "").lower()
             title = (sec.get("title", "") or "").lower()
             text = summary + " " + title
-
-            # 关键词命中数
             kw_hits = sum(1 for t in query_tokens if t in text)
-            # 命中频率（Step 1 命中越多分越高）
-            freq_score = hit_counts.get(sec["section_id"], 0)
-            # 综合分
-            score = kw_hits * 2 + freq_score
-            scored.append({**sec, "_score": score})
-
+            scored.append({**sec, "_score": kw_hits})
         return sorted(scored, key=lambda x: x["_score"], reverse=True)
+
+    def _extract_query_tokens(self, query: str) -> set:
+        """提取 query 关键词（用于 Document/Section 打分）"""
+        tokens = set(query.lower().replace("，", " ").replace("。", " ").split())
+        stopwords = {"是", "的", "了", "吗", "啊", "呢", "什么", "如何", "哪些", "吗", "不"}
+        tokens -= stopwords
+        return {t for t in tokens if len(t) >= 2}
 
     def _graph_navigate(self, seed_chunks: List[dict], doc_id: Optional[str]) -> List[dict]:
         """基于 seed chunks 在图谱中做同 Section 邻居扩展
