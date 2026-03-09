@@ -35,7 +35,9 @@ class RemoteEmbedder:
         if not texts:
             return np.array([])
         
-        logger.info(f"🌐 通过远程服务为 {len(texts)} 个文本生成嵌入...")
+        # 仅在批量处理时打印详细日志
+        if len(texts) > 1:
+            logger.info(f"🌐 通过远程服务为 {len(texts)} 个文本生成嵌入...")
         
         for attempt in range(max_retries):
             try:
@@ -55,7 +57,9 @@ class RemoteEmbedder:
                     logger.error(f"嵌入数量不匹配: 期望 {len(texts)}，实际 {embeddings.shape[0]}")
                     return np.zeros((len(texts), self.dimension))
                 
-                logger.info(f"✅ 远程嵌入成功: API调用 {api_time:.2f}秒")
+                # 仅在批量处理时打印成功日志
+                if len(texts) > 1:
+                    logger.info(f"✅ 远程嵌入成功: API调用 {api_time:.2f}秒")
                 return embeddings
             
             except requests.RequestException as e:

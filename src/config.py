@@ -71,9 +71,16 @@ class Settings(BaseSettings):
     SUMMARY_MAX_LENGTH: int = 200
     SUMMARY_CONCURRENCY: int = 3
     SUMMARY_TIMEOUT: int = 600
+    SUMMARY_MAX_CHUNK_CHARS: int = 4000  # 摘要生成时单次最大字符数
     SUMMARY_API_URL: Optional[str] = None
     SUMMARY_API_KEY: Optional[str] = None
-    
+
+    # 大纲生成配置
+    OUTLINE_MAX_SECTIONS: int = 20  # 最大一级章节数
+    OUTLINE_MIN_SECTIONS: int = 8   # 最小一级章节数
+    OUTLINE_MAX_CHARS: int = 12000   # 用于生成大纲的输入最大字符数
+    OUTLINE_BATCH_CHARS: int = 50000  # 大文件分批处理的批次大小
+
     # LLM文本模型配置
     LLM_API_URL: str = "https://new-api-dev.10rig.com:8443/v1/chat/completions"
     LLM_API_KEY: str = ""

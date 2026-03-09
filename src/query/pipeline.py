@@ -68,6 +68,7 @@ class QueryPipeline:
         stream: bool = False,
         top_k: int = 10,
         enable_lazy_enhance: bool = True,
+        enable_entity_persist: bool = True,  # 新增：是否启用实体持久化
         override_query_type: Optional[str] = None,
         doc_id: Optional[str] = None,
         **kwargs
@@ -117,7 +118,31 @@ class QueryPipeline:
             result.latency_breakdown = latency
             return result
 
-        # 4. Lazy Enhance（仅 relational 类型 + enable_lazy_enhance=True）
+        # 4. Lazy Entity Build（仅 relational 查询的持久化实体图谱）
+        # 首次查询时从 chunks 抽取实体并存储，后续查询直接使用
+        entity_graph_result = None
+        if enable_entity_persist and doc_id and self.lazy_enhancer and query_type == "relational":
+            t0 = time.time()
+            try:
+                # 检查是否已有持久化的实体，没有则抽取并存储
+                entity_graph_result = self.lazy_enhancer.build(
+                    doc_id=doc_id,
+                    chunks=vector_chunks,
+                    force_rebuild=False,
+                )
+                if entity_graph_result:
+                    retrieval_paths.append(f"entity_graph(from_cache={entity_graph_result.get('from_cache', True)})")
+                    logger.info(
+                        f"[{trace_id}] 实体图谱: "
+                        f"缓存={entity_graph_result.get('from_cache', True)}, "
+                        f"实体={len(entity_graph_result.get('entities', []))}, "
+                        f"新增={entity_graph_result.get('new_entities', 0)}"
+                    )
+            except Exception as e:
+                logger.warning(f"[{trace_id}] 实体图谱构建失败（跳过）: {e}")
+            latency["entity_graph"] = round(time.time() - t0, 3)
+
+        # 5. Lazy Enhance（仅 relational 类型 + enable_lazy_enhance=True）
         lazy_entities = []
         if (
             query_type == "relational"
@@ -148,7 +173,7 @@ class QueryPipeline:
                 logger.warning(f"[{trace_id}] Lazy Enhance 失败（跳过）: {e}")
             latency["lazy_enhance"] = round(time.time() - t0, 3)
 
-        # 5. 答案合成
+        # 6. 答案合成
         t0 = time.time()
         graph_ctx = {"chunks": graph_chunks, "communities": community_ctx} if (graph_chunks or community_ctx) else None
 

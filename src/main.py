@@ -99,5 +99,5 @@ if __name__ == "__main__":
         "src.main:app",
         host=settings.API_HOST,
         port=settings.API_PORT,
-        reload=settings.DEBUG
+        reload=False  # 关闭 reload，避免端口占用和多进程问题
     )

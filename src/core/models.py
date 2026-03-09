@@ -555,6 +555,7 @@ class SectionNode(BaseModel):
     level: int
     hierarchy_path: str
     content: Optional[str] = None
+    summary: Optional[str] = None  # 章节摘要，用于宏观检索
     order: int
     parent_section_id: Optional[str] = None
     word_count: Optional[int] = None

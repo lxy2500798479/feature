@@ -7,6 +7,10 @@ LLM 驱动的实体关系抽取器 (Enhanced-KG)
 
 抽取粒度：每个 Chunk 独立抽取（并发执行），保留 chunk_id 溯源。
 成本控制：异步后台执行，不阻塞文档上传响应。
+
+通用 Schema:
+  Entity: id, name, entity_type, description, doc_id, chunk_ids (JSON数组), properties (JSON)
+  RELATION: relation_type, description, strength, chunk_id
 """
 import hashlib
 import json
@@ -16,13 +20,22 @@ from typing import List, Dict, Optional
 
 from src.utils.logger import logger
 
+# ── 默认实体类型 ────────────────────────────────────────────────────────────────────
+
+DEFAULT_ENTITY_TYPES = ["PERSON", "ORG", "PRODUCT", "LOCATION", "EVENT", "CONCEPT"]
+
 # ── Prompt ────────────────────────────────────────────────────────────────────
 
-_EXTRACT_PROMPT = """直接从下面文本中提取实体和关系，输出纯JSON，不要其他内容：
+_EXTRACT_PROMPT = """从下面文本中提取实体和关系，输出纯 JSON，不要其他内容。
+
+要求：
+1. 实体：人名、组织、产品、地点、事件等，每段文本尽量抽 3～8 个实体。
+2. 关系：relations 里的 src、dst 必须与上面 entities 里的 name 完全一致（复制粘贴），这样关系才能连上。每段文本尽量抽 2～6 条关系。
+3. 类型用英文：{entity_types}。
 
 文本：{text}
 
-输出格式：{{"entities":[{"name":"名","type":"类型","description":"描述"}],"relations":[{"src":"A","dst":"B","type":"关系","strength":0.9}]}}"""
+输出格式（严格遵循）：{{"entities":[{"name":"实体名","type":"类型","description":"简短描述"}],"relations":[{"src":"实体A名","dst":"实体B名","type":"关系类型","strength":0.9}]}}"""
 
 
 def _try_extract_json(text: str) -> dict:
@@ -68,9 +81,10 @@ def _try_extract_json(text: str) -> dict:
 class EntityExtractor:
     """LLM 驱动的实体关系抽取器"""
 
-    def __init__(self, llm_client=None, max_workers: int = 3):
+    def __init__(self, llm_client=None, max_workers: int = 3, entity_types: List[str] = None):
         self.llm_client = llm_client
         self.max_workers = max_workers
+        self.entity_types = entity_types or DEFAULT_ENTITY_TYPES
 
     def extract_from_chunks(
         self,
@@ -82,8 +96,8 @@ class EntityExtractor:
 
         Returns:
             {
-                "entities": [{id, name, entity_type, description, doc_id, chunk_id}],
-                "relations": [{src_id, dst_id, relation_type, description, strength}]
+                "entities": [{id, name, entity_type, description, doc_id, chunk_ids}],
+                "relations": [{src_id, dst_id, relation_type, description, strength, chunk_id}]
             }
         """
         if not self.llm_client:
@@ -119,7 +133,10 @@ class EntityExtractor:
 
         # 限制送入 LLM 的文本长度
         text_input = text[:800]
-        prompt = _EXTRACT_PROMPT.replace("{text}", text_input)
+        
+        # 使用配置的 entity_types
+        entity_types_str = "/".join(self.entity_types)
+        prompt = _EXTRACT_PROMPT.replace("{text}", text_input).replace("{entity_types}", entity_types_str)
 
         try:
             raw = self.llm_client.chat(
@@ -141,7 +158,7 @@ class EntityExtractor:
 
     def _merge(self, chunk_results: List[Dict], doc_id: str) -> Dict[str, List[Dict]]:
         """合并多个 chunk 的结果，对同名实体去重，生成稳定 ID"""
-        # name → {id, entity_type, description, doc_id, chunk_id}
+        # name → {id, entity_type, description, doc_id, chunk_ids}
         entity_map: Dict[str, Dict] = {}
         # (src_name, dst_name, rel_type) → relation
         rel_map: Dict[tuple, Dict] = {}
@@ -161,14 +178,17 @@ class EntityExtractor:
                         "entity_type": ent.get("type", "CONCEPT"),
                         "description": ent.get("description", ""),
                         "doc_id": doc_id,
-                        "chunk_id": chunk_id,
+                        "chunk_ids": [chunk_id],  # 改为数组
                     }
                 else:
-                    # 补充 description（取更长的那个）
+                    # 补充 description 和 chunk_ids（取更长的 description，追加 chunk_id）
                     existing = entity_map[name]
                     new_desc = ent.get("description", "")
                     if len(new_desc) > len(existing.get("description", "")):
                         existing["description"] = new_desc
+                    # 追加 chunk_id 到数组
+                    if chunk_id and chunk_id not in existing["chunk_ids"]:
+                        existing["chunk_ids"].append(chunk_id)
 
             for rel in cr.get("relations", []):
                 src_name = rel.get("src", "").strip()
@@ -184,11 +204,18 @@ class EntityExtractor:
                         "relation_type": rtype,
                         "description": rel.get("description", ""),
                         "strength": float(rel.get("strength", 1.0)),
+                        "chunk_id": chunk_id,  # 保留来源 chunk
                     }
 
         # 解析 relation 的 src_id / dst_id（只保留两端实体都存在的关系）
-        final_entities = list(entity_map.values())
+        # 将 chunk_ids 转为 JSON 字符串存储
+        final_entities = []
+        for ent in entity_map.values():
+            ent["chunk_ids"] = json.dumps(ent["chunk_ids"], ensure_ascii=False)
+            final_entities.append(ent)
+        
         final_relations = []
+        dropped = 0
         for rel in rel_map.values():
             src_ent = entity_map.get(rel["src_name"])
             dst_ent = entity_map.get(rel["dst_name"])
@@ -199,7 +226,15 @@ class EntityExtractor:
                     "relation_type": rel["relation_type"],
                     "description": rel["description"],
                     "strength": rel["strength"],
+                    "chunk_id": rel.get("chunk_id", ""),
                 })
+            else:
+                dropped += 1
+        if dropped:
+            logger.warning(
+                f"EntityExtractor: 有 {dropped} 条关系因实体名不匹配被丢弃，"
+                f"请确保 relations 的 src/dst 与 entities 的 name 完全一致 (doc={doc_id})"
+            )
 
         logger.info(
             f"EntityExtractor 合并完成: {len(final_entities)} 实体, "

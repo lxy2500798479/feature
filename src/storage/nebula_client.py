@@ -26,13 +26,26 @@ class NebulaClient:
         self.user = settings.NEBULA_USER
         self.password = settings.NEBULA_PASSWORD
         self.space_name = settings.NEBULA_SPACE
-        
+
         self.config = Config()
         self.config.max_connection_pool_size = 10
-        
+
         self.connection_pool: Optional[ConnectionPool] = None
         self._initialized = False
         self.logger = logger
+
+    def _escape_nebula_string(self, value: str) -> str:
+        """转义 NebulaGraph 字符串中的特殊字符"""
+        if not value:
+            return ""
+        # 替换顺序很重要：先替换反斜杠，再替换引号，最后替换换行等
+        escaped = value
+        escaped = escaped.replace('\\', '\\\\')  # 反斜杠
+        escaped = escaped.replace('"', '\\"')    # 双引号
+        escaped = escaped.replace('\n', '\\n')   # 换行
+        escaped = escaped.replace('\r', '\\r')   # 回车
+        escaped = escaped.replace('\t', '\\t')   # 制表符
+        return escaped
 
     def _parse_vertex_props(self, value) -> Dict:
         """解析 NebulaGraph Vertex 对象的属性"""
@@ -185,16 +198,19 @@ class NebulaClient:
                 """CREATE EDGE IF NOT EXISTS COOCCURS_WITH(weight double, cooccur int);""",
                 # ── Enhanced-KG: 真正的实体关系图谱 ──
                 """CREATE TAG IF NOT EXISTS Entity (
+                    id string,
                     name string,
                     entity_type string,
                     description string DEFAULT "",
                     doc_id string,
-                    chunk_id string DEFAULT ""
+                    chunk_ids string DEFAULT "",
+                    properties string DEFAULT "{}"
                 );""",
                 """CREATE EDGE IF NOT EXISTS RELATION(
                     relation_type string,
                     description string DEFAULT "",
-                    strength double DEFAULT 1.0
+                    strength double DEFAULT 1.0,
+                    chunk_id string DEFAULT ""
                 );""",
                 # 图片实体图谱
                 """CREATE TAG IF NOT EXISTS ImageEntity (
@@ -217,6 +233,7 @@ class NebulaClient:
                 "CREATE TAG INDEX IF NOT EXISTS idx_concept_doc_id ON Concept(doc_id(64));",
                 "CREATE TAG INDEX IF NOT EXISTS idx_entity_doc_id ON Entity(doc_id(64));",
                 "CREATE TAG INDEX IF NOT EXISTS idx_entity_name ON Entity(name(100));",
+                "CREATE TAG INDEX IF NOT EXISTS idx_entity_type ON Entity(entity_type(32));",
             ]
             for iq in index_queries:
                 r = session.execute(iq)
@@ -279,16 +296,19 @@ class NebulaClient:
             """CREATE EDGE IF NOT EXISTS COOCCURS_WITH(weight double, cooccur int);""",
             # ── Enhanced-KG: 真正的实体关系图谱 ──
             """CREATE TAG IF NOT EXISTS Entity (
+                id string,
                 name string,
                 entity_type string,
                 description string DEFAULT "",
                 doc_id string,
-                chunk_id string DEFAULT ""
+                chunk_ids string DEFAULT "",
+                properties string DEFAULT "{}"
             );""",
             """CREATE EDGE IF NOT EXISTS RELATION(
                 relation_type string,
                 description string DEFAULT "",
-                strength double DEFAULT 1.0
+                strength double DEFAULT 1.0,
+                chunk_id string DEFAULT ""
             );""",
         ]
 
@@ -303,6 +323,7 @@ class NebulaClient:
             "CREATE TAG INDEX IF NOT EXISTS idx_concept_doc_id ON Concept(doc_id(64));",
             "CREATE TAG INDEX IF NOT EXISTS idx_entity_doc_id ON Entity(doc_id(64));",
             "CREATE TAG INDEX IF NOT EXISTS idx_entity_name ON Entity(name(100));",
+            "CREATE TAG INDEX IF NOT EXISTS idx_entity_type ON Entity(entity_type(32));",
         ]
         for iq in index_queries:
             r = session.execute(iq)
@@ -375,7 +396,7 @@ class NebulaClient:
             set_clauses = []
             for key, value in properties.items():
                 if isinstance(value, str):
-                    escaped = value.replace('"', '\\"')
+                    escaped = self._escape_nebula_string(value)
                     set_clauses.append(f'{key} = "{escaped}"')
                 elif isinstance(value, bool):
                     set_clauses.append(f'{key} = {str(value).lower()}')
@@ -429,10 +450,10 @@ class NebulaClient:
         """插入章节节点"""
         if not sections:
             return
-            
+
         with self.get_session() as session:
             session.execute(f"USE {self.space_name};")
-            
+
             for section in sections:
                 # 支持 Pydantic 模型或 Dict
                 if hasattr(section, 'model_dump'):
@@ -441,22 +462,44 @@ class NebulaClient:
                     sec = section.dict()
                 else:
                     sec = section
-                    
+
                 section_id = sec.get("section_id", "")
                 doc_id = sec.get("doc_id", "")
                 title = sec.get("title", "")
                 level = sec.get("level", 1)
                 hierarchy_path = sec.get("hierarchy_path", "")
                 content = sec.get("content", "")
+                summary = sec.get("summary", "")
                 order = sec.get("order", 0)
-                
+
+                # 处理特殊字符转义
+                summary_escaped = self._escape_nebula_string(summary) if summary else ""
+
                 query = f'''INSERT VERTEX Section(
-                    doc_id, title, level, hierarchy_path, content, `order`
+                    doc_id, title, level, hierarchy_path, content, summary, `order`
                 ) VALUES "{section_id}":(
-                    "{doc_id}", "{title}", {level}, 
-                    "{hierarchy_path}", "{content}", {order}
+                    "{doc_id}", "{title}", {level},
+                    "{hierarchy_path}", "{content}", "{summary_escaped}", {order}
                 );'''
                 session.execute(query)
+
+    def update_sections_summary(self, doc_id: str, summaries: Dict[str, str]):
+        """更新章节摘要"""
+        if not summaries:
+            return
+
+        with self.get_session() as session:
+            r = session.execute(f"USE {self.space_name};")
+            if not r.is_succeeded():
+                self.logger.error(f"update_sections_summary: USE 失败: {r.error_msg()}")
+                return
+
+            for section_id, summary in summaries.items():
+                summary_escaped = self._escape_nebula_string(summary) if summary else ""
+                query = f'UPDATE VERTEX ON Section "{section_id}" SET summary = "{summary_escaped}";'
+                result = session.execute(query)
+                if not result.is_succeeded():
+                    self.logger.warning(f"更新章节摘要失败: {section_id}, error: {result.error_msg()}")
 
     def insert_chunks(self, chunks):
         """插入文本块节点"""
@@ -729,8 +772,8 @@ class NebulaClient:
     def insert_entity_graph(self, doc_id: str, entities: List[Dict], relations: List[Dict]):
         """插入 LLM 抽取的实体关系图（Enhanced-KG）
 
-        entities: [{id, name, entity_type, description, chunk_id}]
-        relations: [{src_id, dst_id, relation_type, description, strength}]
+        entities: [{id, name, entity_type, description, doc_id, chunk_ids (JSON 字符串)}]
+        relations: [{src_id, dst_id, relation_type, description, strength, chunk_id}]
         """
         with self.get_session() as session:
             session.execute(f"USE {self.space_name};")
@@ -740,11 +783,13 @@ class NebulaClient:
                 name = ent.get("name", "").replace('"', '\\"')
                 etype = ent.get("entity_type", "UNKNOWN").replace('"', '\\"')
                 desc = ent.get("description", "").replace('"', '\\"').replace('\n', ' ')
-                chunk_id = ent.get("chunk_id", "")
+                chunk_ids = ent.get("chunk_ids", "[]").replace('"', '\\"')
+                # properties 字段预留，可存储额外属性
+                properties = ent.get("properties", "{}").replace('"', '\\"')
 
                 q = (
-                    f'INSERT VERTEX Entity(name, entity_type, description, doc_id, chunk_id) '
-                    f'VALUES "{eid}":("{name}", "{etype}", "{desc}", "{doc_id}", "{chunk_id}");'
+                    f'INSERT VERTEX Entity(id, name, entity_type, description, doc_id, chunk_ids, properties) '
+                    f'VALUES "{eid}":("{eid}", "{name}", "{etype}", "{desc}", "{doc_id}", "{chunk_ids}", "{properties}");'
                 )
                 r = session.execute(q)
                 if not r.is_succeeded():
@@ -756,10 +801,11 @@ class NebulaClient:
                 rtype = rel.get("relation_type", "RELATED").replace('"', '\\"')
                 rdesc = rel.get("description", "").replace('"', '\\"').replace('\n', ' ')
                 strength = float(rel.get("strength", 1.0))
+                chunk_id = rel.get("chunk_id", "").replace('"', '\\"')
 
                 q = (
-                    f'INSERT EDGE RELATION(relation_type, description, strength) '
-                    f'VALUES "{src}"->"{dst}":("{rtype}", "{rdesc}", {strength});'
+                    f'INSERT EDGE RELATION(relation_type, description, strength, chunk_id) '
+                    f'VALUES "{src}"->"{dst}":("{rtype}", "{rdesc}", {strength}, "{chunk_id}");'
                 )
                 r = session.execute(q)
                 if not r.is_succeeded():
