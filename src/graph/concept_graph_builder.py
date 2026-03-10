@@ -64,7 +64,7 @@ class ConceptGraphBuilder:
     
     def build_from_chunks(self, chunks: List[ChunkNode], doc_id: str) -> Dict:
         """
-        从文本块构建概念图谱
+        从文本块构建概念图谱（优化大文档内存占用）
         
         Args:
             chunks: 文本块列表
@@ -80,14 +80,23 @@ class ConceptGraphBuilder:
         import time
         
         total_start = time.time()
-        logger.info(f"为文档构建概念图谱: {doc_id} (文本块数: {len(chunks)})")
+        total_chunks = len(chunks)
+        logger.info(f"为文档构建概念图谱: {doc_id} (文本块数: {total_chunks})")
+        
+        # 大文档阈值：超过 1000 个 chunks 使用分批处理
+        LARGE_DOC_THRESHOLD = 1000
+        
+        if total_chunks > LARGE_DOC_THRESHOLD:
+            logger.info(f"检测到大文档 ({total_chunks} chunks)，使用分批处理避免内存溢出")
+            return self._build_from_chunks_batched(chunks, doc_id)
+        
+        # 小文档：正常处理
+        return self._build_from_chunks_normal(chunks, doc_id)
         
         # 重置统计
         self.phrase_freq.clear()
         self.cooccurrence.clear()
         self.total_windows = 0
-        
-        # 1. 提取名词短语
         step_start = time.time()
         texts = [self._clean_text(c.text) for c in chunks]
         n_process = self.n_process
@@ -422,3 +431,159 @@ class ConceptGraphBuilder:
                 "avg_degree": 2 * len(edges) / len(nodes) if len(nodes) > 0 else 0
             }
         }
+
+    def _build_from_chunks_normal(self, chunks: List[ChunkNode], doc_id: str) -> Dict:
+        """正常处理小文档"""
+        import time
+        
+        total_start = time.time()
+        
+        # 重置统计
+        self.phrase_freq.clear()
+        self.cooccurrence.clear()
+        self.total_windows = 0
+        
+        # 1. 提取名词短语
+        step_start = time.time()
+        texts = [self._clean_text(c.text) for c in chunks]
+        n_process = self.n_process
+        if n_process is None:
+            n_process = min(4, (os.cpu_count() or 2))
+        if n_process <= 1:
+            n_process = 1
+        chunk_phrases_list = []
+        if n_process > 1:
+            for doc in self.nlp.pipe(texts, n_process=n_process, batch_size=50):
+                phrases = self._doc_to_phrases(doc)
+                chunk_phrases_list.append(phrases)
+                for phrase in phrases:
+                    self.phrase_freq[phrase] += 1
+        else:
+            for text in texts:
+                phrases = self._extract_noun_phrases(text)
+                chunk_phrases_list.append(phrases)
+                for phrase in phrases:
+                    self.phrase_freq[phrase] += 1
+        all_phrases = [p for phrases in chunk_phrases_list for p in phrases]
+        extract_time = time.time() - step_start
+        logger.info(f"名词短语提取完成 (耗时: {extract_time:.2f}秒, 唯一短语: {len(set(all_phrases))})")
+        
+        # 2. 计算共现关系
+        step_start = time.time()
+        self._compute_cooccurrence_parallel(chunk_phrases_list)
+        cooccur_time = time.time() - step_start
+        logger.info(f"共现计算完成 (耗时: {cooccur_time:.2f}秒, 共现对数: {len(self.cooccurrence)})")
+        
+        # 3. 过滤低频短语
+        step_start = time.time()
+        filtered_phrases = self._filter_phrases()
+        filter_time = time.time() - step_start
+        logger.info(f"短语过滤完成 (耗时: {filter_time:.2f}秒, 剩余: {len(filtered_phrases)} 个)")
+        
+        # 4. 计算 PMI 并构建图
+        step_start = time.time()
+        graph = self._build_graph(filtered_phrases)
+        graph_time = time.time() - step_start
+        logger.info(f"图构建完成 (耗时: {graph_time:.2f}秒, 节点: {graph.number_of_nodes()}, 边: {graph.number_of_edges()})")
+        
+        # 5. 社区检测
+        step_start = time.time()
+        communities = self._detect_communities(graph)
+        community_time = time.time() - step_start
+        logger.info(f"社区检测完成 (耗时: {community_time:.2f}秒, 社区数: {len(set(communities.values())) if communities else 0})")
+        
+        # 6. 生成输出
+        step_start = time.time()
+        result = self._generate_output(graph, communities, doc_id)
+        output_time = time.time() - step_start
+        
+        total_time = time.time() - total_start
+        logger.info(f"概念图谱构建总耗时: {total_time:.2f}秒")
+        
+        return result
+
+    def _build_from_chunks_batched(self, chunks: List[ChunkNode], doc_id: str) -> Dict:
+        """分批处理大文档（流式处理，降低内存峰值）"""
+        import time
+        
+        total_start = time.time()
+        
+        # 重置统计
+        self.phrase_freq.clear()
+        self.cooccurrence.clear()
+        self.total_windows = 0
+        
+        # 分批大小：每批 500 个 chunks
+        BATCH_SIZE = 500
+        total_batches = (len(chunks) + BATCH_SIZE - 1) // BATCH_SIZE
+        
+        logger.info(f"大文档分批处理: {len(chunks)} chunks → {total_batches} 批次")
+        
+        # 1. 分批提取名词短语（流式处理，不保留所有文本）
+        step_start = time.time()
+        n_process = self.n_process or min(4, (os.cpu_count() or 2))
+        
+        for batch_idx in range(total_batches):
+            start_idx = batch_idx * BATCH_SIZE
+            end_idx = min(start_idx + BATCH_SIZE, len(chunks))
+            batch_chunks = chunks[start_idx:end_idx]
+            
+            # 提取短语
+            texts = [self._clean_text(c.text) for c in batch_chunks]
+            batch_phrases_list = []
+            
+            if n_process > 1:
+                for doc in self.nlp.pipe(texts, n_process=n_process, batch_size=50):
+                    phrases = self._doc_to_phrases(doc)
+                    batch_phrases_list.append(phrases)
+                    for phrase in phrases:
+                        self.phrase_freq[phrase] += 1
+            else:
+                for text in texts:
+                    phrases = self._extract_noun_phrases(text)
+                    batch_phrases_list.append(phrases)
+                    for phrase in phrases:
+                        self.phrase_freq[phrase] += 1
+            
+            # 计算共现（批内）
+            self._compute_cooccurrence_parallel(batch_phrases_list)
+            
+            # 释放内存
+            del texts
+            del batch_phrases_list
+            
+            if (batch_idx + 1) % 5 == 0 or batch_idx == total_batches - 1:
+                logger.info(
+                    f"  批次进度: {batch_idx + 1}/{total_batches} "
+                    f"({(batch_idx + 1) * 100 // total_batches}%), "
+                    f"唯一短语: {len(self.phrase_freq)}"
+                )
+        
+        extract_time = time.time() - step_start
+        logger.info(f"分批短语提取完成 (耗时: {extract_time:.2f}秒, 唯一短语: {len(self.phrase_freq)})")
+        
+        # 2. 过滤低频短语
+        step_start = time.time()
+        filtered_phrases = self._filter_phrases()
+        filter_time = time.time() - step_start
+        logger.info(f"短语过滤完成 (耗时: {filter_time:.2f}秒, 剩余: {len(filtered_phrases)} 个)")
+        
+        # 3. 构建图（只保留高频短语，大幅降低内存）
+        step_start = time.time()
+        graph = self._build_graph(filtered_phrases)
+        graph_time = time.time() - step_start
+        logger.info(f"图构建完成 (耗时: {graph_time:.2f}秒, 节点: {graph.number_of_nodes()}, 边: {graph.number_of_edges()})")
+        
+        # 4. 社区检测
+        step_start = time.time()
+        communities = self._detect_communities(graph)
+        community_time = time.time() - step_start
+        logger.info(f"社区检测完成 (耗时: {community_time:.2f}秒, 社区数: {len(set(communities.values())) if communities else 0})")
+        
+        # 5. 生成输出
+        result = self._generate_output(graph, communities, doc_id)
+        
+        total_time = time.time() - total_start
+        logger.info(f"大文档概念图谱构建总耗时: {total_time:.2f}秒")
+        
+        return result

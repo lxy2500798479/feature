@@ -559,6 +559,9 @@ class SectionNode(BaseModel):
     order: int
     parent_section_id: Optional[str] = None
     word_count: Optional[int] = None
+    # 流式解析用：章节在文件中的字符偏移（不写入 Nebula）
+    start_char: Optional[int] = None
+    end_char: Optional[int] = None
 
 
 class ChunkNode(BaseModel):

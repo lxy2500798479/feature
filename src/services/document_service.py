@@ -124,12 +124,19 @@ class DocumentService:
         section_summary_time = 0.0
 
         if need_community_summary:
-            community_summary_time = self._generate_community_summary(
+            import time
+            start = time.time()
+            summaries = self._generate_community_summary(
                 parsed_doc=parsed_doc,
                 concept_graph=concept_graph,
                 doc_id=doc_id,
                 need_community_summary=need_community_summary,
             )
+            # 存储社区摘要到 NebulaGraph
+            if summaries:
+                self.nebula_client.store_community_summaries(doc_id, summaries)
+                logger.info(f"✅ 社区摘要已存储: {len(summaries)} 个")
+            community_summary_time = time.time() - start
 
         # 4b. 生成 Section Summary（CoE Step 2 精排用）
         if self.summary_enabled and parsed_doc.sections:
@@ -211,6 +218,7 @@ class DocumentService:
         self.nebula_client.insert_document(doc_metadata)
 
         # 插入章节节点
+        logger.info(f"正在写入 NebulaGraph: {len(parsed_doc.sections)} sections, {len(parsed_doc.chunks)} chunks...")
         self.nebula_client.insert_sections(parsed_doc.sections)
 
         # 插入文本块节点

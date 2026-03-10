@@ -52,7 +52,7 @@ class TextEmbedder:
         concept_mapping: Optional[Dict[str, List[str]]] = None,
         community_mapping: Optional[Dict[str, int]] = None
     ) -> List[Dict]:
-        """为文本块生成嵌入向量"""
+        """为文本块生成嵌入向量（优化大文档内存占用）"""
         import time
         start_time = time.time()
         
@@ -60,10 +60,18 @@ class TextEmbedder:
             logger.warning("嵌入器未初始化，返回空嵌入")
             return []
         
-        logger.info(f"🔢 开始为 {len(chunks)} 个文本块生成嵌入向量...")
+        total_chunks = len(chunks)
+        logger.info(f"🔢 开始为 {total_chunks} 个文本块生成嵌入向量...")
         
+        # 大文档阈值：超过 2000 个 chunks 使用流式批处理
+        LARGE_DOC_THRESHOLD = 2000
+        
+        if total_chunks > LARGE_DOC_THRESHOLD:
+            logger.info(f"检测到大文档 ({total_chunks} chunks)，使用流式批处理")
+            return self._embed_chunks_batched(chunks, concept_mapping, community_mapping)
+        
+        # 小文档：正常处理
         texts = [chunk.text for chunk in chunks]
-        
         embeddings = self._encode_texts(texts)
         
         results = []
@@ -115,3 +123,74 @@ class TextEmbedder:
         if hasattr(vec, 'tolist'):
             return vec.tolist()
         return list(vec)
+
+    def _embed_chunks_batched(
+        self,
+        chunks: List[ChunkNode],
+        concept_mapping: Optional[Dict[str, List[str]]] = None,
+        community_mapping: Optional[Dict[str, int]] = None
+    ) -> List[Dict]:
+        """流式批处理大文档嵌入（降低内存峰值）"""
+        import time
+        
+        start_time = time.time()
+        results = []
+        
+        # 每批处理 500 个 chunks
+        BATCH_SIZE = 500
+        total_batches = (len(chunks) + BATCH_SIZE - 1) // BATCH_SIZE
+        
+        logger.info(f"大文档嵌入分批处理: {len(chunks)} chunks → {total_batches} 批次")
+        
+        for batch_idx in range(total_batches):
+            batch_start = time.time()
+            start_idx = batch_idx * BATCH_SIZE
+            end_idx = min(start_idx + BATCH_SIZE, len(chunks))
+            batch_chunks = chunks[start_idx:end_idx]
+            
+            # 提取文本
+            texts = [chunk.text for chunk in batch_chunks]
+            
+            # 生成嵌入
+            embeddings = self._encode_texts(texts)
+            
+            # 构建结果
+            for i, chunk in enumerate(batch_chunks):
+                concepts = concept_mapping.get(chunk.chunk_id, []) if concept_mapping else []
+                
+                communities = []
+                if community_mapping and concepts:
+                    communities = list(set([
+                        community_mapping.get(concept, -1)
+                        for concept in concepts
+                    ]))
+                
+                result = {
+                    "chunk_id": chunk.chunk_id,
+                    "doc_id": chunk.doc_id,
+                    "section_id": chunk.section_id,
+                    "embedding": embeddings[i],
+                    "text": chunk.text,
+                    "token_count": chunk.token_count,
+                    "position": chunk.position,
+                    "concepts": concepts,
+                    "communities": communities,
+                }
+                results.append(result)
+            
+            # 释放内存
+            del texts
+            del embeddings
+            
+            batch_time = time.time() - batch_start
+            if (batch_idx + 1) % 5 == 0 or batch_idx == total_batches - 1:
+                logger.info(
+                    f"  嵌入批次进度: {batch_idx + 1}/{total_batches} "
+                    f"({(batch_idx + 1) * 100 // total_batches}%), "
+                    f"本批耗时: {batch_time:.2f}秒"
+                )
+        
+        elapsed = time.time() - start_time
+        logger.info(f"✅ 大文档嵌入完成: {len(results)} 个, 总耗时 {elapsed:.2f}秒")
+        
+        return results

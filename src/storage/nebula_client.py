@@ -492,41 +492,57 @@ class NebulaClient:
             self.logger.info(f"插入结果: {result.is_succeeded()}, error: {result.error_msg() if not result.is_succeeded() else 'None'}")
 
     def insert_sections(self, sections):
-        """插入章节节点"""
+        """插入章节节点（批量优化）"""
         if not sections:
             return
 
         with self.get_session() as session:
             session.execute(f"USE {self.space_name};")
 
-            for section in sections:
-                # 支持 Pydantic 模型或 Dict
-                if hasattr(section, 'model_dump'):
-                    sec = section.model_dump()
-                elif hasattr(section, 'dict'):
-                    sec = section.dict()
-                else:
-                    sec = section
+            # 批量插入：每批 100 个
+            BATCH_SIZE = 100
+            total_batches = (len(sections) + BATCH_SIZE - 1) // BATCH_SIZE
+            
+            for batch_idx in range(total_batches):
+                start_idx = batch_idx * BATCH_SIZE
+                end_idx = min(start_idx + BATCH_SIZE, len(sections))
+                batch_sections = sections[start_idx:end_idx]
+                
+                # 构建批量 INSERT 语句
+                values_parts = []
+                for section in batch_sections:
+                    # 支持 Pydantic 模型或 Dict
+                    if hasattr(section, 'model_dump'):
+                        sec = section.model_dump()
+                    elif hasattr(section, 'dict'):
+                        sec = section.dict()
+                    else:
+                        sec = section
 
-                section_id = sec.get("section_id", "")
-                doc_id = sec.get("doc_id", "")
-                title = sec.get("title", "")
-                level = sec.get("level", 1)
-                hierarchy_path = sec.get("hierarchy_path", "")
-                content = sec.get("content", "")
-                summary = sec.get("summary", "")
-                order = sec.get("order", 0)
+                    section_id = sec.get("section_id", "")
+                    doc_id = sec.get("doc_id", "")
+                    title = self._escape_nebula_string(sec.get("title", ""))
+                    level = sec.get("level", 1)
+                    hierarchy_path = sec.get("hierarchy_path", "")
+                    content = self._escape_nebula_string(sec.get("content", ""))
+                    summary = self._escape_nebula_string(sec.get("summary", ""))
+                    order = sec.get("order", 0)
 
-                # 处理特殊字符转义
-                summary_escaped = self._escape_nebula_string(summary) if summary else ""
-
-                query = f'''INSERT VERTEX Section(
-                    doc_id, title, level, hierarchy_path, content, summary, `order`
-                ) VALUES "{section_id}":(
-                    "{doc_id}", "{title}", {level},
-                    "{hierarchy_path}", "{content}", "{summary_escaped}", {order}
-                );'''
-                session.execute(query)
+                    values_parts.append(
+                        f'"{section_id}":("{doc_id}", "{title}", {level}, '
+                        f'"{hierarchy_path}", "{content}", "{summary}", {order})'
+                    )
+                
+                # 批量插入
+                query = (
+                    f'INSERT VERTEX Section(doc_id, title, level, hierarchy_path, content, summary, `order`) '
+                    f'VALUES {", ".join(values_parts)};'
+                )
+                result = session.execute(query)
+                if not result.is_succeeded():
+                    logger.warning(f"Section 批量插入失败 (批次 {batch_idx + 1}): {result.error_msg()}")
+            
+            logger.info(f"✅ Section 批量插入完成: {len(sections)} 个")
 
     def update_sections_summary(self, doc_id: str, summaries: Dict[str, str]):
         """更新章节摘要"""
@@ -547,47 +563,69 @@ class NebulaClient:
                     self.logger.warning(f"更新章节摘要失败: {section_id}, error: {result.error_msg()}")
 
     def insert_chunks(self, chunks):
-        """插入文本块节点"""
+        """插入文本块节点（批量优化）"""
         if not chunks:
             return
             
         with self.get_session() as session:
             session.execute(f"USE {self.space_name};")
             
-            for chunk in chunks:
-                # 支持 Pydantic 模型或 Dict
-                if hasattr(chunk, 'model_dump'):
-                    ch = chunk.model_dump()
-                elif hasattr(chunk, 'dict'):
-                    ch = chunk.dict()
-                else:
-                    ch = chunk
+            # 批量插入：每批 100 个
+            BATCH_SIZE = 100
+            total_batches = (len(chunks) + BATCH_SIZE - 1) // BATCH_SIZE
+            
+            for batch_idx in range(total_batches):
+                start_idx = batch_idx * BATCH_SIZE
+                end_idx = min(start_idx + BATCH_SIZE, len(chunks))
+                batch_chunks = chunks[start_idx:end_idx]
+                
+                # 构建批量 INSERT 语句
+                values_parts = []
+                for chunk in batch_chunks:
+                    # 支持 Pydantic 模型或 Dict
+                    if hasattr(chunk, 'model_dump'):
+                        ch = chunk.model_dump()
+                    elif hasattr(chunk, 'dict'):
+                        ch = chunk.dict()
+                    else:
+                        ch = chunk
+                        
+                    chunk_id = ch.get("chunk_id", "")
+                    section_id = ch.get("section_id", "")
+                    doc_id = ch.get("doc_id", "")
+                    text = self._escape_nebula_string(ch.get("text", ""))
+                    token_count = ch.get("token_count", 0)
+                    position = ch.get("position", 0)
                     
-                chunk_id = ch.get("chunk_id", "")
-                section_id = ch.get("section_id", "")
-                doc_id = ch.get("doc_id", "")
-                text = ch.get("text", "")
-                token_count = ch.get("token_count", 0)
-                position = ch.get("position", 0)
+                    values_parts.append(
+                        f'"{chunk_id}":("{section_id}", "{doc_id}", "{text}", {token_count}, {position})'
+                    )
                 
-                # 清理文本中的特殊字符
-                text = text.replace('"', '\\"').replace('\n', ' ')
-                
-                query = f'''INSERT VERTEX Chunk(
-                    section_id, doc_id, text, token_count, position
-                ) VALUES "{chunk_id}":(
-                    "{section_id}", "{doc_id}", "{text}", 
-                    {token_count}, {position}
-                );'''
-                session.execute(query)
+                # 批量插入
+                query = (
+                    f'INSERT VERTEX Chunk(section_id, doc_id, text, token_count, position) '
+                    f'VALUES {", ".join(values_parts)};'
+                )
+                result = session.execute(query)
+                if not result.is_succeeded():
+                    logger.warning(f"Chunk 批量插入失败 (批次 {batch_idx + 1}): {result.error_msg()}")
+            
+            logger.info(f"✅ Chunk 批量插入完成: {len(chunks)} 个")
 
     def insert_edges(self, edges):
-        """插入边关系"""
+        """插入边关系（批量优化）"""
         if not edges:
             return
             
         with self.get_session() as session:
             session.execute(f"USE {self.space_name};")
+            
+            # 按边类型分组
+            edges_by_type = {
+                "HAS_SECTION": [],
+                "HAS_CHUNK": [],
+                "CONTAINS_CONCEPT": [],
+            }
             
             for edge in edges:
                 # 支持 Pydantic 模型或 Dict
@@ -603,52 +641,97 @@ class NebulaClient:
                 edge_type = e.get("edge_type", "")
                 
                 if edge_type in ("has_section",):
-                    query = f'INSERT EDGE HAS_SECTION() VALUES "{src_id}"->"{dst_id}":();'
+                    edges_by_type["HAS_SECTION"].append((src_id, dst_id))
                 elif edge_type in ("has_chunk", "contains_chunk"):
-                    query = f'INSERT EDGE HAS_CHUNK() VALUES "{src_id}"->"{dst_id}":();'
+                    edges_by_type["HAS_CHUNK"].append((src_id, dst_id))
                 elif edge_type == "contains_concept":
-                    query = f'INSERT EDGE CONTAINS_CONCEPT() VALUES "{src_id}"->"{dst_id}":();'
-                elif edge_type in ("next_chunk", "next_section", "belongs_to", "related_to", "has_concept"):
+                    edges_by_type["CONTAINS_CONCEPT"].append((src_id, dst_id))
+            
+            # 批量插入每种类型的边
+            BATCH_SIZE = 100
+            for edge_type, edge_list in edges_by_type.items():
+                if not edge_list:
                     continue
-                else:
-                    continue
+                
+                total_batches = (len(edge_list) + BATCH_SIZE - 1) // BATCH_SIZE
+                for batch_idx in range(total_batches):
+                    start_idx = batch_idx * BATCH_SIZE
+                    end_idx = min(start_idx + BATCH_SIZE, len(edge_list))
+                    batch_edges = edge_list[start_idx:end_idx]
                     
-                session.execute(query)
+                    # 构建批量 INSERT 语句
+                    values_parts = [f'"{src}"->"{dst}":()' for src, dst in batch_edges]
+                    query = f'INSERT EDGE {edge_type}() VALUES {", ".join(values_parts)};'
+                    
+                    result = session.execute(query)
+                    if not result.is_succeeded():
+                        logger.warning(f"{edge_type} 批量插入失败 (批次 {batch_idx + 1}): {result.error_msg()}")
+                
+                logger.info(f"✅ {edge_type} 批量插入完成: {len(edge_list)} 条")
 
     def insert_concept_graph(self, doc_id: str, nodes: List[Dict], edges: List[Dict]):
-        """插入概念图谱节点和边（Concept 节点 + COOCCURS_WITH 边）"""
+        """插入概念图谱节点和边（批量优化）"""
         with self.get_session() as session:
             session.execute(f"USE {self.space_name};")
 
-            # 插入 Concept 节点（字段：phrase, freq, community, doc_id）
-            for node in nodes:
-                concept_id = node.get("id", "")
-                phrase = node.get("phrase", "").replace('"', '\\"').replace('\\', '\\\\')
-                freq = int(node.get("freq", 0))
-                community = int(node.get("community", -1))
+            # 批量插入 Concept 节点
+            BATCH_SIZE = 100
+            if nodes:
+                total_batches = (len(nodes) + BATCH_SIZE - 1) // BATCH_SIZE
+                for batch_idx in range(total_batches):
+                    start_idx = batch_idx * BATCH_SIZE
+                    end_idx = min(start_idx + BATCH_SIZE, len(nodes))
+                    batch_nodes = nodes[start_idx:end_idx]
+                    
+                    values_parts = []
+                    for node in batch_nodes:
+                        concept_id = node.get("id", "")
+                        phrase = self._escape_nebula_string(node.get("phrase", ""))
+                        freq = int(node.get("freq", 0))
+                        community = int(node.get("community", -1))
+                        
+                        values_parts.append(
+                            f'"{concept_id}":("{phrase}", {freq}, {community}, "{doc_id}")'
+                        )
+                    
+                    query = (
+                        f'INSERT VERTEX Concept(phrase, freq, community, doc_id) '
+                        f'VALUES {", ".join(values_parts)};'
+                    )
+                    r = session.execute(query)
+                    if not r.is_succeeded():
+                        self.logger.warning(f"Concept 批量插入失败 (批次 {batch_idx + 1}): {r.error_msg()}")
+                
+                logger.info(f"✅ Concept 节点批量插入完成: {len(nodes)} 个")
 
-                query = (
-                    f'INSERT VERTEX Concept(phrase, freq, community, doc_id) '
-                    f'VALUES "{concept_id}":("{phrase}", {freq}, {community}, "{doc_id}");'
-                )
-                r = session.execute(query)
-                if not r.is_succeeded():
-                    self.logger.warning(f"Concept 节点插入失败 {concept_id}: {r.error_msg()}")
-
-            # 插入 COOCCURS_WITH 边（字段：weight, cooccur）
-            for edge in edges:
-                src_id = edge.get("from", "")
-                dst_id = edge.get("to", "")
-                weight = float(edge.get("weight", 0.0))
-                cooccur = int(edge.get("cooccur", 0))
-
-                query = (
-                    f'INSERT EDGE COOCCURS_WITH(weight, cooccur) '
-                    f'VALUES "{src_id}"->"{dst_id}":({weight}, {cooccur});'
-                )
-                r = session.execute(query)
-                if not r.is_succeeded():
-                    self.logger.warning(f"COOCCURS_WITH 边插入失败 {src_id}->{dst_id}: {r.error_msg()}")
+            # 批量插入 COOCCURS_WITH 边
+            if edges:
+                total_batches = (len(edges) + BATCH_SIZE - 1) // BATCH_SIZE
+                for batch_idx in range(total_batches):
+                    start_idx = batch_idx * BATCH_SIZE
+                    end_idx = min(start_idx + BATCH_SIZE, len(edges))
+                    batch_edges = edges[start_idx:end_idx]
+                    
+                    values_parts = []
+                    for edge in batch_edges:
+                        src_id = edge.get("from", "")
+                        dst_id = edge.get("to", "")
+                        weight = float(edge.get("weight", 0.0))
+                        cooccur = int(edge.get("cooccur", 0))
+                        
+                        values_parts.append(
+                            f'"{src_id}"->"{dst_id}":({weight}, {cooccur})'
+                        )
+                    
+                    query = (
+                        f'INSERT EDGE COOCCURS_WITH(weight, cooccur) '
+                        f'VALUES {", ".join(values_parts)};'
+                    )
+                    r = session.execute(query)
+                    if not r.is_succeeded():
+                        self.logger.warning(f"COOCCURS_WITH 批量插入失败 (批次 {batch_idx + 1}): {r.error_msg()}")
+                
+                logger.info(f"✅ COOCCURS_WITH 边批量插入完成: {len(edges)} 条")
     
     def insert_image_entities(self, nodes: List, edges: List[Dict]):
         """插入图片实体节点和边"""
@@ -695,20 +778,40 @@ class NebulaClient:
                     self.logger.warning(f"图片关系边插入失败 {src_id}->{dst_id}: {r.error_msg()}")
 
     def store_community_summaries(self, doc_id: str, summaries: Dict[int, str]):
-        """存储社区摘要"""
+        """存储社区摘要（批量优化）"""
+        if not summaries:
+            return
+            
         with self.get_session() as session:
             session.execute(f"USE {self.space_name};")
             
-            for community_id, summary in summaries.items():
-                # 转义特殊字符
-                summary = summary.replace('"', '\\"').replace('\n', ' ')
+            # 批量插入：每批 50 个（摘要文本较长）
+            BATCH_SIZE = 50
+            items = list(summaries.items())
+            total_batches = (len(items) + BATCH_SIZE - 1) // BATCH_SIZE
+            
+            for batch_idx in range(total_batches):
+                start_idx = batch_idx * BATCH_SIZE
+                end_idx = min(start_idx + BATCH_SIZE, len(items))
+                batch_items = items[start_idx:end_idx]
                 
-                query = f'''INSERT VERTEX CommunitySummary(
-                    doc_id, community_id, summary
-                ) VALUES "{doc_id}_{community_id}":(
-                    "{doc_id}", {community_id}, "{summary}"
-                );'''
-                session.execute(query)
+                values_parts = []
+                for community_id, summary in batch_items:
+                    summary_escaped = self._escape_nebula_string(summary)
+                    vid = f"{doc_id}_{community_id}"
+                    values_parts.append(
+                        f'"{vid}":("{doc_id}", {community_id}, "{summary_escaped}")'
+                    )
+                
+                query = (
+                    f'INSERT VERTEX CommunitySummary(doc_id, community_id, summary) '
+                    f'VALUES {", ".join(values_parts)};'
+                )
+                result = session.execute(query)
+                if not result.is_succeeded():
+                    logger.warning(f"CommunitySummary 批量插入失败 (批次 {batch_idx + 1}): {result.error_msg()}")
+            
+            logger.info(f"✅ CommunitySummary 批量插入完成: {len(summaries)} 个")
 
     def get_document_status(self, doc_id: str) -> Dict:
         """获取文档状态（FETCH 直接返回各属性列，避免 Vertex 类型解析差异）"""
@@ -819,7 +922,7 @@ class NebulaClient:
         return sorted(results, key=lambda x: x["order"])
 
     def insert_entity_graph(self, doc_id: str, entities: List[Dict], relations: List[Dict]):
-        """插入 LLM 抽取的实体关系图（Enhanced-KG）
+        """插入 LLM 抽取的实体关系图（批量优化）
 
         entities: [{id, name, entity_type, description, doc_id, chunk_ids (JSON 字符串)}]
         relations: [{src_id, dst_id, relation_type, description, strength, chunk_id}]
@@ -827,38 +930,68 @@ class NebulaClient:
         with self.get_session() as session:
             session.execute(f"USE {self.space_name};")
 
-            for ent in entities:
-                eid = ent.get("id", "")
-                name = ent.get("name", "").replace('"', '\\"')
-                etype = ent.get("entity_type", "UNKNOWN").replace('"', '\\"')
-                desc = ent.get("description", "").replace('"', '\\"').replace('\n', ' ')
-                chunk_ids = ent.get("chunk_ids", "[]").replace('"', '\\"')
-                # properties 字段预留，可存储额外属性
-                properties = ent.get("properties", "{}").replace('"', '\\"')
+            # 批量插入 Entity 节点
+            BATCH_SIZE = 100
+            if entities:
+                total_batches = (len(entities) + BATCH_SIZE - 1) // BATCH_SIZE
+                for batch_idx in range(total_batches):
+                    start_idx = batch_idx * BATCH_SIZE
+                    end_idx = min(start_idx + BATCH_SIZE, len(entities))
+                    batch_entities = entities[start_idx:end_idx]
+                    
+                    values_parts = []
+                    for ent in batch_entities:
+                        eid = ent.get("id", "")
+                        name = self._escape_nebula_string(ent.get("name", ""))
+                        etype = self._escape_nebula_string(ent.get("entity_type", "UNKNOWN"))
+                        desc = self._escape_nebula_string(ent.get("description", ""))
+                        chunk_ids = self._escape_nebula_string(ent.get("chunk_ids", "[]"))
+                        properties = self._escape_nebula_string(ent.get("properties", "{}"))
+                        
+                        values_parts.append(
+                            f'"{eid}":("{eid}", "{name}", "{etype}", "{desc}", "{doc_id}", "{chunk_ids}", "{properties}")'
+                        )
+                    
+                    q = (
+                        f'INSERT VERTEX Entity(id, name, entity_type, description, doc_id, chunk_ids, properties) '
+                        f'VALUES {", ".join(values_parts)};'
+                    )
+                    r = session.execute(q)
+                    if not r.is_succeeded():
+                        self.logger.warning(f"Entity 批量插入失败 (批次 {batch_idx + 1}): {r.error_msg()}")
+                
+                logger.info(f"✅ Entity 节点批量插入完成: {len(entities)} 个")
 
-                q = (
-                    f'INSERT VERTEX Entity(id, name, entity_type, description, doc_id, chunk_ids, properties) '
-                    f'VALUES "{eid}":("{eid}", "{name}", "{etype}", "{desc}", "{doc_id}", "{chunk_ids}", "{properties}");'
-                )
-                r = session.execute(q)
-                if not r.is_succeeded():
-                    self.logger.warning(f"Entity 插入失败 {eid}: {r.error_msg()}")
-
-            for rel in relations:
-                src = rel.get("src_id", "")
-                dst = rel.get("dst_id", "")
-                rtype = rel.get("relation_type", "RELATED").replace('"', '\\"')
-                rdesc = rel.get("description", "").replace('"', '\\"').replace('\n', ' ')
-                strength = float(rel.get("strength", 1.0))
-                chunk_id = rel.get("chunk_id", "").replace('"', '\\"')
-
-                q = (
-                    f'INSERT EDGE RELATION(relation_type, description, strength, chunk_id) '
-                    f'VALUES "{src}"->"{dst}":("{rtype}", "{rdesc}", {strength}, "{chunk_id}");'
-                )
-                r = session.execute(q)
-                if not r.is_succeeded():
-                    self.logger.warning(f"RELATION 边插入失败 {src}->{dst}: {r.error_msg()}")
+            # 批量插入 RELATION 边
+            if relations:
+                total_batches = (len(relations) + BATCH_SIZE - 1) // BATCH_SIZE
+                for batch_idx in range(total_batches):
+                    start_idx = batch_idx * BATCH_SIZE
+                    end_idx = min(start_idx + BATCH_SIZE, len(relations))
+                    batch_relations = relations[start_idx:end_idx]
+                    
+                    values_parts = []
+                    for rel in batch_relations:
+                        src = rel.get("src_id", "")
+                        dst = rel.get("dst_id", "")
+                        rtype = self._escape_nebula_string(rel.get("relation_type", "RELATED"))
+                        rdesc = self._escape_nebula_string(rel.get("description", ""))
+                        strength = float(rel.get("strength", 1.0))
+                        chunk_id = self._escape_nebula_string(rel.get("chunk_id", ""))
+                        
+                        values_parts.append(
+                            f'"{src}"->"{dst}":("{rtype}", "{rdesc}", {strength}, "{chunk_id}")'
+                        )
+                    
+                    q = (
+                        f'INSERT EDGE RELATION(relation_type, description, strength, chunk_id) '
+                        f'VALUES {", ".join(values_parts)};'
+                    )
+                    r = session.execute(q)
+                    if not r.is_succeeded():
+                        self.logger.warning(f"RELATION 批量插入失败 (批次 {batch_idx + 1}): {r.error_msg()}")
+                
+                logger.info(f"✅ RELATION 边批量插入完成: {len(relations)} 条")
 
     def update_entity_chunk_ids(self, entity_id: str, chunk_ids_json: str):
         """更新实体的 chunk_ids（用于增量扩展时合并）"""

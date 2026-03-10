@@ -2,9 +2,10 @@
 TXT 文档解析器
 """
 import hashlib
+import re
 import uuid
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 
 from src.config import settings
 from src.core.models import (
@@ -54,7 +55,7 @@ class TxtParser(BaseParser):
         return ext in [".txt", ".text"]
     
     def parse(self, file_path: str) -> ParsedDocument:
-        """解析 TXT 文件"""
+        """解析 TXT 文件（优化大文件内存占用）"""
         logger.info(f"TxtParser 解析: {file_path}")
         
         file_path_obj = Path(file_path)
@@ -62,7 +63,19 @@ class TxtParser(BaseParser):
         # 生成 doc_id
         doc_id = self._generate_doc_id(file_path)
         
-        # 读取内容
+        # 检查文件大小
+        file_size = file_path_obj.stat().st_size
+        file_size_mb = file_size / (1024 * 1024)
+        logger.info(f"文件大小: {file_size_mb:.2f} MB")
+        
+        # 大文件阈值：50MB
+        LARGE_FILE_THRESHOLD = 50 * 1024 * 1024
+        
+        if file_size > LARGE_FILE_THRESHOLD:
+            logger.info(f"检测到大文件 ({file_size_mb:.2f} MB)，使用流式处理")
+            return self._parse_large_file(file_path, doc_id)
+        
+        # 小文件：正常处理
         with open(file_path, "r", encoding="utf-8") as f:
             content = f.read()
         
@@ -318,7 +331,7 @@ class TxtParser(BaseParser):
                 start = end
                 continue
 
-            chunk_id = f"{doc_id}_chunk_{position}"
+            chunk_id = f"{section_id}_chunk_{position}" if section_id else f"{doc_id}_chunk_{position}"
 
             chunk = ChunkNode(
                 chunk_id=chunk_id,
@@ -408,3 +421,150 @@ class TxtParser(BaseParser):
             )
         
         return edges
+
+    def _parse_large_file(self, file_path: str, doc_id: str) -> ParsedDocument:
+        """流式处理大文件（优化：单次顺序读取，边读边分块）"""
+        file_path_obj = Path(file_path)
+
+        metadata = DocumentMetadata(
+            doc_id=doc_id,
+            title=file_path_obj.stem,
+            file_path=str(file_path),
+            file_type="txt",
+        )
+
+        logger.info(f"开始流式处理大文件: {file_path}")
+
+        # 预编译章节标题正则
+        _HEADING_PATTERNS = [
+            (re.compile(r"^第([一二三四五六七八九十百千\d]+)[章节卷部篇集]"), 1),
+            (re.compile(r"^#{1,6}\s+(.+)$"), 6),
+            (re.compile(r"^(\d+)\.\s+(.+)$"), 2),
+        ]
+
+        sections = []
+        chunks = []
+        global_position = 0
+        section_idx = 0
+
+        # 当前章节状态
+        current_section_title = "开篇"
+        current_section_content = []  # 使用列表累积
+        current_section_lines = 0
+        line_count = 0
+
+        # 单次顺序读取：逐行处理，边读边分块
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line_count += 1
+                line_stripped = line.strip()
+
+                # 每 10000 行打印进度
+                if line_count % 10000 == 0:
+                    logger.info(f"  读取进度: {line_count} 行, {section_idx} 章节, {len(chunks)} chunks")
+
+                # 检测章节标题
+                is_heading = False
+                heading_title = None
+                for pattern, level in _HEADING_PATTERNS:
+                    match = pattern.match(line_stripped)
+                    if match:
+                        if level == 1:
+                            heading_title = match.group(1) if match.lastindex else line_stripped[:20]
+                        elif level == 6:
+                            heading_title = match.group(1).strip()[:50]
+                        else:
+                            heading_title = (match.group(2).strip() if match.lastindex >= 2 else line_stripped)[:50]
+                        is_heading = True
+                        break
+
+                # 遇到新章节且当前章节有足够内容
+                if is_heading and heading_title and current_section_lines > 10:
+                    # 处理上一章节
+                    section_content = "".join(current_section_content)
+                    if section_content.strip():
+                        section_id = f"{doc_id}_sec_{section_idx}"
+                        section = SectionNode(
+                            section_id=section_id,
+                            doc_id=doc_id,
+                            title=current_section_title,
+                            level=1,
+                            hierarchy_path=str(section_idx),
+                            content="",
+                            order=section_idx,
+                        )
+                        sections.append(section)
+
+                        # 分块
+                        section_chunks = self._chunk_content(
+                            section_content, doc_id, section_id
+                        )
+                        for chunk in section_chunks:
+                            chunk.position = global_position
+                            global_position += 1
+                        chunks.extend(section_chunks)
+
+                        section_idx += 1
+
+                    # 开始新章节
+                    current_section_title = heading_title
+                    current_section_content = []
+                    current_section_lines = 0
+                else:
+                    # 累积章节内容
+                    current_section_content.append(line)
+                    current_section_lines += 1
+
+        # 处理最后一个章节
+        section_content = "".join(current_section_content)
+        if section_content.strip():
+            section_id = f"{doc_id}_sec_{section_idx}"
+            section = SectionNode(
+                section_id=section_id,
+                doc_id=doc_id,
+                title=current_section_title,
+                level=1,
+                hierarchy_path=str(section_idx),
+                content="",
+                order=section_idx,
+            )
+            sections.append(section)
+
+            section_chunks = self._chunk_content(
+                section_content, doc_id, section_id
+            )
+            for chunk in section_chunks:
+                chunk.position = global_position
+                global_position += 1
+            chunks.extend(section_chunks)
+
+        # 如果没有检测到章节，创建默认章节
+        if not sections:
+            logger.warning("未检测到章节标题，回退到简单分块")
+            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+            section_id = f"{doc_id}_sec_0"
+            section = SectionNode(
+                section_id=section_id,
+                doc_id=doc_id,
+                title="全文",
+                level=1,
+                hierarchy_path="0",
+                content="",
+                order=0,
+            )
+            sections.append(section)
+            chunks = self._chunk_content(content, doc_id, section_id)
+            for i, chunk in enumerate(chunks):
+                chunk.position = i
+
+        edges = self._build_edges(sections, chunks)
+        logger.info(f"✅ 大文件流式解析完成: {len(sections)} sections, {len(chunks)} chunks")
+
+        return ParsedDocument(
+            metadata=metadata,
+            sections=sections,
+            chunks=chunks,
+            edges=edges,
+        )
+
