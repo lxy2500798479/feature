@@ -115,6 +115,10 @@ class Settings(BaseSettings):
     # 上传配置
     UPLOAD_DIR: Path = PROJECT_ROOT / "uploads"
     MAX_UPLOAD_SIZE: int = 100 * 1024 * 1024  # 100MB
+
+
+    ENABLE_CONCEPT_GRAPH = False
+
     
     class Config:
         env_file = ENV_FILE

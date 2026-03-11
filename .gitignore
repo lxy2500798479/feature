@@ -1,5 +1,46 @@
-mockData/
+# 虚拟环境
 .venv
-.idea/
-uploads/
+venv
+env
+
+# Python 编译产物
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+*.manifest
+*.spec
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 运行时 / 数据
+uploads/
+mockData/
+mineruData/
+*.log
+logs/
+
+# 测试 / 工具缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 其他
+*.zip
+*.bak
