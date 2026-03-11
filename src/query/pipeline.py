@@ -24,6 +24,7 @@ class PipelineResult:
     sources: List[dict] = field(default_factory=list)
     graph_context: Optional[dict] = None
     vector_context: Optional[List[dict]] = None
+    entity_graph_result: Optional[dict] = None  # LazyEntityBuilder.build() 的 entities/relations
     metadata: Optional[dict] = field(default_factory=dict)
     query_type: str = "auto"
     retrieval_paths_used: List[str] = field(default_factory=list)
@@ -201,6 +202,7 @@ class QueryPipeline:
                 sources=vector_chunks[:5],
                 vector_context=vector_chunks,
                 graph_context=graph_ctx,
+                entity_graph_result=entity_graph_result,
                 query_type=query_type,
                 retrieval_paths_used=retrieval_paths,
                 budget_summary=budget,
@@ -224,6 +226,7 @@ class QueryPipeline:
                 sources=vector_chunks[:5],
                 vector_context=vector_chunks,
                 graph_context=graph_ctx,
+                entity_graph_result=entity_graph_result,
                 query_type=query_type,
                 retrieval_paths_used=retrieval_paths,
                 budget_summary=budget,

@@ -327,6 +327,7 @@ async def enhanced_query(request: EnhancedQueryRequest):
         embed_ms = (time.time() - embed_start) * 1000
         logger.info(f"查询嵌入耗时: {embed_ms:.0f}ms")
 
+        doc_id = request.doc_ids[0] if request.doc_ids else None
         pipe_result = await asyncio.wait_for(
             asyncio.to_thread(
                 pipeline.execute,
@@ -337,16 +338,20 @@ async def enhanced_query(request: EnhancedQueryRequest):
                 top_k=request.top_k,
                 enable_lazy_enhance=request.enable_lazy_enhance,
                 override_query_type=request.override_query_type,
+                doc_id=doc_id,
             ),
             timeout=query_timeout,
         )
 
         took_ms = (time.time() - start) * 1000
+        chunks = pipe_result.vector_context or pipe_result.sources or []
+        entity_result = pipe_result.entity_graph_result or {}
         return EnhancedQueryResponse(
             query=request.query,
             answer=pipe_result.answer,
-            results=pipe_result.chunks,
-            total=len(pipe_result.chunks),
+            results=chunks,
+            graph_results=(pipe_result.graph_context or {}).get("chunks", []),
+            total=len(chunks),
             took_ms=round(took_ms, 1),
             meta=QueryMeta(
                 query_type=pipe_result.query_type,
@@ -357,6 +362,8 @@ async def enhanced_query(request: EnhancedQueryRequest):
                 degradation_reasons=pipe_result.degradation_reasons,
                 trace_id=pipe_result.trace_id,
             ),
+            entities=entity_result.get("entities", []),
+            relations=entity_result.get("relations", []),
         )
     except HTTPException:
         raise

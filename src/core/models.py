@@ -727,10 +727,15 @@ class EnhancedQueryRequest(BaseModel):
 
 class EnhancedQueryResponse(BaseModel):
     """增强查询响应"""
-    results: List[Dict[str, Any]]
-    graph_results: List[Dict[str, Any]]
-    total: int
     query: str
+    answer: str = ""
+    results: List[Dict[str, Any]] = Field(default_factory=list)
+    graph_results: List[Dict[str, Any]] = Field(default_factory=list)
+    total: int = 0
+    took_ms: float = 0.0
+    meta: Optional["QueryMeta"] = None
+    entities: List[Dict[str, Any]] = Field(default_factory=list)  # LazyEntityBuilder 实体
+    relations: List[Dict[str, Any]] = Field(default_factory=list)  # LazyEntityBuilder 关系
 
 
 class QueryMeta(BaseModel):
